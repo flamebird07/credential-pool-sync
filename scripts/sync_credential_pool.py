@@ -42,7 +42,7 @@ def tk(p, ak, bu, model_name):
         if ia:
             r = urllib.request.Request(f"{bu}/v1/messages", data=json.dumps({"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), headers={"Content-Type": "application/json", "x-api-key": ak, "anthropic-version": "2023-06-01"})
         else:
-            r = urllib.request.Request(f"{bu}/v1/chat/completions", data=json.dumps({"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {ak}"})
+            chat_path = "/chat/completions" if bu.endswith("/v4") or bu.endswith("/v3") or bu.endswith("/v2") else "/v1/chat/completions"; r = urllib.request.Request(f"{bu}{chat_path}", data=json.dumps({"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {ak}"})
         json.loads(urllib.request.urlopen(r, timeout=15).read()); return True, S_A, None
     except urllib.error.HTTPError as e:
         eb = e.read().decode("utf-8", errors="replace")[:200]
