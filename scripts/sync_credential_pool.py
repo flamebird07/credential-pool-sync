@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v2.0 — 含连通性验证 + 状态回写"""
+"""凭证池同步脚本 v2.1 — 含连通性验证 + 状态回写 + 自动切换"""
 import json, os, urllib.request, time
 from pathlib import Path
 
@@ -34,14 +34,15 @@ def us(t, rid, s, n=None):
     if n: f["\u5907\u6ce8"] = n
     urllib.request.urlopen(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
 
-def tk(p, ak, bu):
+def tk(p, ak, bu, model_name):
     if not ak or not bu: return False, S_I, "\u7f3a\u5c11\u5fc5\u586b"
     bu = bu.rstrip("/"); ia = "anthropic" in bu.lower() or "longcat" in bu.lower()
+    test_model = model_name or "deepseek-v4-flash"
     try:
         if ia:
-            r = urllib.request.Request(f"{bu}/v1/messages", data=json.dumps({"model": "claude-sonnet-4-20250514", "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), headers={"Content-Type": "application/json", "x-api-key": ak, "anthropic-version": "2023-06-01"})
+            r = urllib.request.Request(f"{bu}/v1/messages", data=json.dumps({"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "hi"}]}).encode(), headers={"Content-Type": "application/json", "x-api-key": ak, "anthropic-version": "2023-06-01"})
         else:
-            r = urllib.request.Request(f"{bu}/v1/chat/completions", data=json.dumps({"model": "deepseek-v4-flash", "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {ak}"})
+            r = urllib.request.Request(f"{bu}/v1/chat/completions", data=json.dumps({"model": test_model, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}).encode(), headers={"Content-Type": "application/json", "Authorization": f"Bearer {ak}"})
         json.loads(urllib.request.urlopen(r, timeout=15).read()); return True, S_A, None
     except urllib.error.HTTPError as e:
         eb = e.read().decode("utf-8", errors="replace")[:200]
@@ -55,7 +56,7 @@ def tk(p, ak, bu):
     except Exception as e: return False, S_I, f"\u5f02\u5e38: {str(e)[:80]}"
 
 def sync():
-    print("="*50); print("\u51ed\u8bc1\u6c60\u540c\u6b65 v2.0"); print("="*50)
+    print("="*50); print("\u51ed\u8bc1\u6c60\u540c\u6b65 v2.1"); print("="*50)
     tok = gt(); rs = gr(tok); print(f"\n\U0001f4cb \u98de\u4e66: {len(rs)} \u6761")
     for r in rs: us(tok, r["record_id"], S_U)
     print("  \u2705 \u6807\u8bb0\u4e3a \u23f3 \u672a\u9a8c\u8bc1")
@@ -66,12 +67,14 @@ def sync():
         bu = str(f.get("Base URL", "") or "").strip(); m = str(f.get("\u6a21\u578b", "") or "").strip()
         pr = int(f.get("\u4f18\u5148\u7ea7", 0)) if isinstance(f.get("\u4f18\u5148\u7ea7"), (int, float)) else 99
         if not p or not ak or ak == "***": print(f"\n  \u23ed\ufe0f [{l or p}] \u8df3\u8fc7"); us(tok, rid, S_I, "\u7f3a\u5c11\u5fc5\u586b"); continue
-        print(f"\n  \U0001f50d [{l or p}] ...", end=" "); iv, s, e = tk(p, ak, bu)
+        print(f"\n  \U0001f50d [{l or p}] ...", end=" "); iv, s, e = tk(p, ak, bu, m)
         if iv:
             print(f"\u2705 {s}"); vc += 1
             us(tok, rid, s, f"\u9a8c\u8bc1\u901a\u8fc7 | {m}" if m else "\u9a8c\u8bc1\u901a\u8fc7")
+            pn = p.lower().replace(".", "-").replace(" ", "-").replace(":", "-")
+            if not pn.startswith("custom:"): pn = "custom:" + pn
             eid = f"sync-{(m or l).lower().replace(' ', '-')}"
-            fe.setdefault(p, []).append({"id": eid, "label": l or m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "last_status": "active", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
+            fe.setdefault(pn, []).append({"id": eid, "label": l or m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "last_status": "active", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
         else: print(f"\u274c {s}"); ic += 1; us(tok, rid, s, e)
         time.sleep(0.3)
     print(f"\n{'='*50}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548")
