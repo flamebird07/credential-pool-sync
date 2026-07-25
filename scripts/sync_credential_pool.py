@@ -36,7 +36,7 @@ def us(t, rid, s, n=None):
 
 def tk(p, ak, bu, model_name):
     if not ak or not bu: return False, S_I, "\u7f3a\u5c11\u5fc5\u586b"
-    bu = bu.rstrip("/"); ia = "anthropic" in bu.lower() or "longcat" in bu.lower()
+    bu = bu.rstrip("/"); ia = "anthropic" in bu.lower()
     test_model = model_name or "deepseek-v4-flash"
     try:
         if ia:
