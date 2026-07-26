@@ -11,7 +11,7 @@ def auth_list():
             provider = m.group(1)
             providers[provider] = {"active": None, "creds": []}
             continue
-        m2 = re.match(r"^\s+#(\d+)\s+(.+?)\s+api_key\s+(\S+)\s*(←)?", line)
+        m2 = re.match(r'^\s+#(\d+)\s+(.+?)\s+api_key\s+(.*?)\s*(←)?\s*$', line)
         if m2 and provider:
             idx, label, source = m2.group(1), m2.group(2), m2.group(3)
             is_active = m2.group(4) is not None
