@@ -196,10 +196,13 @@ def check_and_rotate():
 
 
 def _auth_list():
-    """解析 hermes auth list 输出，返回所有 providers 和所有凭证"""
+    """解析 hermes auth list 输出，失败时使用缓存"""
+    global _last_auth_list_cache
     r = subprocess.run(["hermes", "auth", "list"], capture_output=True, text=True, timeout=15)
-    if r.returncode != 0: return {}, []
-    providers = {}  # {provider_name: {'active': cred_info, 'creds': [cred_info]}}
+    if r.returncode != 0:
+        logger.warning("four-step-enforcer: hermes auth list failed, using cached state")
+        return _last_auth_list_cache[1], _last_auth_list_cache[0]
+    providers = {}
     all_creds = []
     current_provider = None
     for line in r.stdout.splitlines():
@@ -217,6 +220,7 @@ def _auth_list():
             all_creds.append(cred_info)
             if is_active:
                 providers[current_provider]['active'] = cred_info
+    _last_auth_list_cache = (all_creds, providers)
     return providers, all_creds
 
 
