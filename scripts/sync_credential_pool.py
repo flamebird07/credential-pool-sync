@@ -56,6 +56,12 @@ def extract_text(v):
     if isinstance(v, list) and v: return v[0].get("text", str(v[0]))
     return str(v) if v else ""
 
+def normalize_provider(provider):
+    return provider.replace("custom:", "", 1).strip().lower()
+
+def credential_key(provider, label):
+    return normalize_provider(provider), label.strip()
+
 def test_key(ak, bu, mn):
     if not ak or not bu: return False, S_INVALID, "\u7f3a\u5c11\u5fc5\u586b"
     bu = bu.rstrip("/"); ia = "anthropic" in bu.lower()
@@ -130,6 +136,7 @@ def sync():
         ),
     )
 
+    removed, remove_failed = remove_stale_credentials(records)
     vc, ic = 0, 0
     for record in records:
         rid = record["record_id"]; pr = record["provider"]; pn = record["provider_name"]
@@ -146,7 +153,7 @@ def sync():
             if existing[1]:  # all_creds
                 for cred in existing[1]:
                     # 归一化 provider 名称进行比较（hermes 返回 custom:ark，我们需要比较 ark）
-                    cred_provider = cred['provider'].replace('custom:', '', 1).lower()
+                    cred_provider = normalize_provider(cred["provider"])
                     if cred['label'] == (lb or mn) and cred_provider == pn.lower():
                         already_exists = True
                         break
@@ -167,7 +174,32 @@ def sync():
             print(f"\u274c {st}"); ic += 1; update_status(tok, rid, st, err)
         time.sleep(0.3)
     check_and_rotate()
-    print(f"\n{'='*60}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*60}")
+    print(f"\n{'='*60}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548 | \U0001f5d1\ufe0f {removed} \u5df2\u5220\u9664 | \u26a0\ufe0f {remove_failed} \u5220\u9664\u5931\u8d25\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*60}")
+
+def remove_stale_credentials(feishu_records):
+    expected = {
+        credential_key(r["provider_name"], r["label"] or r["model"])
+        for r in feishu_records
+        if r["provider_name"]
+    }
+    _, local_credentials = _auth_list()
+    managed_providers = {normalize_provider(provider) for provider in PROVIDER_MAP.values()}
+    stale_by_provider = {}
+    for cred in local_credentials:
+        provider = normalize_provider(cred["provider"])
+        if provider not in managed_providers:
+            continue
+        if credential_key(cred["provider"], cred["label"]) not in expected:
+            stale_by_provider.setdefault(cred["provider"], []).append(cred)
+
+    removed, failed = 0, 0
+    for provider, credentials in stale_by_provider.items():
+        for cred in sorted(credentials, key=lambda item: int(item["idx"]), reverse=True):
+            if _remove_cred(provider, cred["idx"]):
+                removed += 1
+            else:
+                failed += 1
+    return removed, failed
 
 def check_and_rotate():
     """同步后检测所有 Provider 的活跃凭证健康状态，失效则自动轮转"""
