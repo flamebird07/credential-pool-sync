@@ -4,6 +4,7 @@
 import json, os, re, subprocess, urllib.request, time, sys
 import logging
 from pathlib import Path
+import yaml
 
 def load_env():
     env_path = Path.home() / '.hermes' / '.env'
@@ -174,7 +175,93 @@ def sync():
             print(f"\u274c {st}"); ic += 1; update_status(tok, rid, st, err)
         time.sleep(0.3)
     check_and_rotate()
-    print(f"\n{'='*60}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548 | \U0001f5d1\ufe0f {removed} \u5df2\u5220\u9664 | \u26a0\ufe0f {remove_failed} \u5220\u9664\u5931\u8d25\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*60}")
+    fallback_removed = cleanup_fallback_chain(records)
+    print(f"\n{'='*60}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548 | \U0001f5d1\ufe0f {removed} \u5df2\u5220\u9664 | \u26a0\ufe0f {remove_failed} \u5220\u9664\u5931\u8d25 | \U0001f517 {fallback_removed} fallback \u5df2\u6e05\u7406\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*60}")
+
+def cleanup_fallback_chain(feishu_records):
+    """Remove fallback entries whose model/base URL pair is absent from Feishu."""
+    try:
+        result = subprocess.run(
+            ["hermes", "fallback", "list"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except Exception as exc:
+        logger.warning("hermes fallback list failed: %s", exc)
+        return 0
+    if result.returncode != 0:
+        logger.warning(
+            "hermes fallback list failed: %s",
+            (result.stderr or result.stdout).strip(),
+        )
+        return 0
+
+    current_entries = set()
+    entry_pattern = re.compile(
+        r"^\s*\d+\.\s+(.+?)\s+\(via\s+[^)]+\)\s+\[([^\]]+)\]\s*$"
+    )
+    for line in result.stdout.splitlines():
+        match = entry_pattern.match(line)
+        if match:
+            current_entries.add(
+                (match.group(1).strip().casefold(), match.group(2).rstrip("/").casefold())
+            )
+    if not current_entries:
+        return 0
+
+    expected_entries = {
+        (record["model"].strip().casefold(), record["base_url"].rstrip("/").casefold())
+        for record in feishu_records
+        if record["model"].strip() and record["base_url"].strip()
+    }
+    stale_entries = current_entries - expected_entries
+    if not stale_entries:
+        return 0
+
+    hermes_home = Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes"))
+    config_path = hermes_home / "config.yaml"
+    try:
+        with open(config_path, encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file) or {}
+        chain = config.get("fallback_providers")
+        if not isinstance(chain, list):
+            logger.warning("fallback_providers is not a list in %s", config_path)
+            return 0
+
+        kept = []
+        removed = 0
+        for entry in chain:
+            if not isinstance(entry, dict):
+                kept.append(entry)
+                continue
+            key = (
+                str(entry.get("model", "")).strip().casefold(),
+                str(entry.get("base_url", "")).rstrip("/").casefold(),
+            )
+            if key in stale_entries:
+                removed += 1
+                print(f"  \U0001f5d1\ufe0f \u6e05\u7406 stale fallback: {entry.get('model')} [{entry.get('base_url')}]")
+            else:
+                kept.append(entry)
+        if not removed:
+            return 0
+
+        config["fallback_providers"] = kept
+        temp_path = config_path.with_suffix(".yaml.tmp")
+        with open(temp_path, "w", encoding="utf-8", newline="\n") as config_file:
+            yaml.safe_dump(
+                config,
+                config_file,
+                allow_unicode=True,
+                sort_keys=False,
+                default_flow_style=False,
+            )
+        os.replace(temp_path, config_path)
+        return removed
+    except Exception as exc:
+        logger.warning("failed to clean fallback chain in %s: %s", config_path, exc)
+        return 0
 
 def remove_stale_credentials(feishu_records):
     expected = {
