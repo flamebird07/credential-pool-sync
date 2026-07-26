@@ -93,7 +93,7 @@ def auth_add(provider, ak, label=None):
         return r.returncode == 0, r.stdout.strip() or r.stderr.strip()
     except: return False, "\u8c03\u7528\u5931\u8d25"
 
-def sync():
+def sync(skip_rotate=False):
     print("="*60); print("\u51ed\u8bc1\u6c60\u540c\u6b65 v3.0"); print("="*60)
     tok = get_feishu_token(); rs = get_records(tok)
     print(f"\n\U0001f4cb {len(rs)} \u6761\u8bb0\u5f55")
@@ -174,9 +174,10 @@ def sync():
         else:
             print(f"\u274c {st}"); ic += 1; update_status(tok, rid, st, err)
         time.sleep(0.3)
-    check_and_rotate()
+    check_and_rotate(skip_rotate)
     fallback_removed = cleanup_fallback_chain(records)
     print(f"\n{'='*60}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548 | \U0001f5d1\ufe0f {removed} \u5df2\u5220\u9664 | \u26a0\ufe0f {remove_failed} \u5220\u9664\u5931\u8d25 | \U0001f517 {fallback_removed} fallback \u5df2\u6e05\u7406\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*60}")
+    print('__RECORDS__' + json.dumps([{'provider': r['provider'], 'provider_name': r['provider_name'], 'label': r['label'], 'model': r['model'], 'base_url': r['base_url'], 'api_key': r['api_key']} for r in records], ensure_ascii=False, default=str))
 
 def cleanup_fallback_chain(feishu_records):
     """Remove fallback entries whose model/base URL pair is absent from Feishu."""
@@ -288,8 +289,10 @@ def remove_stale_credentials(feishu_records):
                 failed += 1
     return removed, failed
 
-def check_and_rotate():
+def check_and_rotate(skip_rotate=False):
     """同步后检测所有 Provider 的活跃凭证健康状态，失效则自动轮转"""
+    if skip_rotate:
+        return
     providers, all_creds = _auth_list()
     if not providers:
         print("⚠️ 无活跃凭证，尝试同步恢复...")
@@ -395,4 +398,5 @@ def run_sync_again():
     subprocess.run([sys.executable, os.path.join(script_dir, "sync_credential_pool.py")], capture_output=True, text=True, timeout=120)
 
 
-if __name__ == "__main__": sync()
+if __name__ == "__main__":
+    sync("--skip-health-rotate" in sys.argv[1:])
