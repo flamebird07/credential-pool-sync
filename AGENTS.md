@@ -18,7 +18,7 @@
 - 按批准方案修改代码
 - 不得自行增减功能
 
-### Step 4: Codex CLI 复审
+### Step 4: Kimi Code CLI 复审
 - 验证修改是否正确
 - 结论：PASS 或 FAIL
 - FAIL 则回到 Step 2
@@ -36,6 +36,7 @@ Step 1 → Step 2 → Step 3 → Step 4
 
 | 工具 | 职责 |
 |------|------|
-| Codex CLI | 审查、方案、复审 |
+| Codex CLI | 审查、方案 |
 | Codex CLI | 执行修改 |
+| Kimi Code CLI | 复审 |
 | Hermes | 调度和项目管理 |
