@@ -1,110 +1,116 @@
 # 凭证池同步工具 (Credential Pool Sync)
 
-将飞书多维表格中的 API Key 自动同步到 Hermes auth.json 凭证池，支持连通性验证和状态回写。
+将飞书多维表格中的 API Key 自动同步到 Hermes 凭证池，支持连通性验证、状态回写和定时同步。
 
-## 功能特性
+## 适用场景
 
-### 🔑 凭证管理
-- 从飞书多维表格读取 API Key 配置
-- 自动写入 Hermes auth.json 凭证池
-- 支持多个 Provider（custom、xiaomi、anthropic 等）
-- 按优先级自动排序
+- 多台机器共享同一套 API Key 配置
+- 通过飞书表格集中管理 API Key（增/改/删）
+- 自动检测无效或限流的 Key
 
-### ✅ 连通性验证
-- 同步时自动测试每个 API Key 是否有效
-- OpenAI 兼容 / Anthropic 兼容双协议支持
-- 验证结果回写飞书表格（正常/无效/限流）
+## 前置条件
 
-### 📊 状态回写
-- 飞书表格"状态"字段实时显示验证结果
-- ✅ 正常 / ❌ 无效 / ⚠️ 限流 / ⏳ 未验证
-- 无效 Key 不会写入凭证池
+| 条件 | 说明 |
+|------|------|
+| Hermes Agent | v0.144+（凭证池功能） |
+| Python | 3.10+ |
+| 飞书访问权限 | 凭证池子表的阅读+写入权限 |
 
-## 快速开始
+## 安装
 
-### 环境要求
-- Python 3.10+
-- Hermes Agent（凭证池功能）
-- 飞书多维表格访问权限
-
-### 安装
+### 1. 克隆仓库
 
 ```bash
 git clone https://github.com/flamebird07/credential-pool-sync.git
 cd credential-pool-sync
 ```
 
-### 配置飞书凭证
+### 2. 配置飞书环境变量
 
-在 `scripts/sync_credential_pool.py` 中配置：
-```python
-FEISHU_APP_ID = "your_app_id"
-FEISHU_APP_SECRET = "your_app_secret"
-BASE_TOKEN = "your_base_token"
-TABLE_ID = "your_table_id"
+```bash
+cp .env.example ~/.hermes/.env
+# 编辑 ~/.hermes/.env，填入真实值
+chmod 600 ~/.hermes/.env
 ```
+
+飞书应用需要具备以下权限：
+- bitable:app（多维表格）
+- 凭证池子表的读取和写入权限
+
+### 3. 配置 Hermes
+
+在 Hermes config.yaml 的 custom_providers 中注册 Provider：
+
+```yaml
+custom_providers:
+  - name: ARK
+    base_url: https://ark.cn-beijing.volces.com/api/plan/v3
+  - name: longcat
+    base_url: https://api.longcat.chat/anthropic
+  - name: xiaomi
+    base_url: https://api.xiaomimimo.com/anthropic
+  - name: Z.AI
+    base_url: https://open.bigmodel.cn/api/paas/v4
+```
+
+Provider 的 name 必须与飞书表格中的 Provider 字段值大小写完全一致。
+
+## 使用
 
 ### 手动同步
 
 ```bash
+cd credential-pool-sync
 python scripts/sync_credential_pool.py
 ```
 
 ### 定时自动同步
 
 ```bash
-hermes cron create "0 6 * * *"   --name "credential-pool-sync"   --prompt "运行凭证池同步脚本"   --deliver local
+hermes cron create credential-pool-sync --schedule "*/30 * * * *" --script cron_sync.sh --no-agent --deliver origin
 ```
 
 ## 飞书表格结构
 
-### 凭证池子表
+| 字段名 | 类型 | 说明 | 必填 |
+|--------|------|------|:----:|
+| Provider | 文本 | Provider 名称 | ✅ |
+| Label | 文本 | 显示标签 | |
+| API Key | 文本 | API 密钥原文 | ✅ |
+| Base URL | 文本 | API 端点地址 | ✅ |
+| 优先级 | 数字 | 优先级（0=最高） | |
 
-| 字段名 | 类型 | 说明 |
-|--------|------|------|
-| Provider | 文本 | provider 名称 |
-| Label | 文本 | 显示标签 |
-| 模型 | 文本 | 模型名称 |
-| API Key | 文本 | API 密钥 |
-| Base URL | 文本 | API 端点地址 |
-| 优先级 | 数字 | 优先级（0=最高） |
-| 状态 | 单选 | ✅正常/❌无效/⚠️限流/⏳未验证 |
-| 备注 | 文本 | 用途说明或错误信息 |
+## 安全性说明
 
-### 链接
+| 风险 | 缓解措施 |
+|------|----------|
+| API Key 明文存储在飞书表格 | 确保飞书表格的访问权限最小化 |
+| 飞书 App Secret 存储在 ~/.hermes/.env | 文件权限设为 600 |
+| 脚本硬编码 Base Token | 如需更换飞书表格需修改脚本 |
+| 凭证传输到 Hermes | 通过 hermes auth add CLI 添加 |
 
-https://zcnrpnpxvcyt.feishu.cn/base/YedtbFYKZatu2QsGti9ch7xbnGc?table=tblOSK9HexYVOHBW
+## 故障排除
+
+| 问题 | 原因 | 解决 |
+|------|------|------|
+| hermes auth list 看不到新增的 Provider | Hermes 未自动发现 | 检查 config.yaml custom_providers |
+| 同步脚本报 401 | 飞书 App Secret 错误 | 检查 ~/.hermes/.env |
+| 同步脚本报 429 | API Key 已限流 | 飞书表格状态会更新 |
+| Cron job 不执行 | Gateway 未运行 | 运行 hermes gateway run |
+| Provider Key 不匹配 | 大小写不一致 | 确保与 config.yaml 完全一致 |
 
 ## 项目结构
 
 ```
 credential-pool-sync/
 ├── scripts/
-│   └── sync_credential_pool.py   # 主同步脚本（含验证）
-├── README.md                     # 项目说明
-├── AGENTS.md                     # 开发规范（4步法）
-└── .gitignore                    # Git 忽略规则
+│   ├── sync_credential_pool.py
+│   └── cron_sync.sh
+├── .env.example
+├── README.md
+└── .gitignore
 ```
-
-## 验证流程
-
-同步脚本执行时会：
-1. 读取飞书表格所有记录
-2. 全部标记为"⏳ 未验证"
-3. 逐条测试连通性（HTTP 请求最小 token）
-4. 有效 Key → 写入 auth.json + 标记"✅ 正常"
-5. 无效 Key → 不写入 + 标记"❌ 无效" + 记录错误信息
-6. 限流 Key → 不写入 + 标记"⚠️ 限流"
-
-## 开发规范
-
-本项目采用 **4步法** 开发流程，详见 [AGENTS.md](AGENTS.md)。
 
 ## 许可证
 
-MIT License
-
-## 联系方式
-
-- GitHub: [flamebird07](https://github.com/flamebird07)
-- 项目地址: https://github.com/flamebird07/credential-pool-sync
+MIT

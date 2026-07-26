@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """凭证池同步脚本 v3.0 — 使用 hermes auth add CLI 而非直接写 auth.json"""
 
-import json, os, subprocess, urllib.request, time, sys
+import json, os, re, subprocess, urllib.request, time, sys
 from pathlib import Path
 
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")  # MUST be set in env
