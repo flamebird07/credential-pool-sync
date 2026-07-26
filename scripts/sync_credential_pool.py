@@ -4,6 +4,17 @@
 import json, os, re, subprocess, urllib.request, time, sys
 from pathlib import Path
 
+def load_env():
+    env_path = Path.home() / '.hermes' / '.env'
+    if env_path.exists():
+        with open(env_path) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#') and '=' in line:
+                    k, v = line.split('=', 1)
+                    os.environ.setdefault(k.strip(), v.strip())
+load_env()
+
 FEISHU_APP_ID = os.environ.get("FEISHU_APP_ID", "")  # MUST be set in env
 FEISHU_APP_SECRET = os.environ.get("FEISHU_APP_SECRET", "")  # MUST be set in env
 BASE_TOKEN = "YedtbFYKZatu2QsGti9ch7xbnGc"
