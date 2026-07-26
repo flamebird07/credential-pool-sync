@@ -42,17 +42,13 @@ def main():
         print("ERROR: 无法读取凭证池")
         sys.exit(1)
     
-    # Group by provider and find one with >1 cred
-    from collections import Counter
-    prov_counts = Counter(c["provider"] for c in all_creds)
-    multi_provs = [p for p, n in prov_counts.items() if n > 1]
-    
-    if not multi_provs:
-        print("所有 Provider 都只有 1 个凭证，无法切换")
+    # 任何 Provider 都可轮转：直接使用当前活跃凭证的 Provider
+    active_provider = active["provider"] if active else None
+    if not active_provider:
+        print("ERROR: 无活跃凭证")
         sys.exit(1)
-    
-    # Pick the first multi-cred provider
-    target_prov = multi_provs[0]
+
+    target_prov = active_provider
     target_creds = [c for c in all_creds if c["provider"] == target_prov]
     active_cred = next((c for c in target_creds if c["active"]), target_creds[0])
     

@@ -25,7 +25,7 @@ S_OK = "\u2705 \u6b63\u5e38"
 S_INVALID = "\u274c \u65e0\u6548"
 S_RATE_LIMITED = "\u26a0\ufe0f \u9650\u6d41"
 
-PROVIDER_MAP = {"ARK": "ARK", "longcat": "longcat", "xiaomi": "xiaomi", "Z.AI": "Z.AI"}
+PROVIDER_MAP = {"ARK": "ARK", "longcat": "longcat", "xiaomi": "xiaomi", "Z.AI": "Z.AI", "DeepSeek": "DeepSeek"}
 
 def get_feishu_token():
     d = json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode()
@@ -99,6 +99,22 @@ def sync():
         ok, st, err = test_key(ak, bu, mn)
         if ok:
             print(f"\u2705 {st}"); vc += 1
+            # 检查是否已存在（通过 hermes auth list 检查相同 label+provider）
+            existing = _auth_list()
+            already_exists = False
+            if existing[1]:  # all_creds
+                for cred in existing[1]:
+                    # 归一化 provider 名称进行比较（hermes 返回 custom:ark，我们需要比较 ark）
+                    cred_provider = cred['provider'].replace('custom:', '', 1).lower()
+                    if cred['label'] == (lb or mn) and cred_provider == pn.lower():
+                        already_exists = True
+                        break
+            
+            if already_exists:
+                print(f"    ⏭️ 已存在，跳过")
+                update_status(tok, rid, S_OK, f"已存在 | {mn}" if mn else "已存在")
+                continue
+            
             cok, cmsg = auth_add(pn, ak, lb or mn)
             if cok:
                 update_status(tok, rid, S_OK, f"\u9a8c\u8bc1\u901a\u8fc7 | {mn}" if mn else "\u9a8c\u8bc1\u901a\u8fc7")
@@ -109,6 +125,110 @@ def sync():
         else:
             print(f"\u274c {st}"); ic += 1; update_status(tok, rid, st, err)
         time.sleep(0.3)
+    check_and_rotate()
     print(f"\n{'='*60}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*60}")
+
+def check_and_rotate():
+    """同步后检测所有 Provider 的活跃凭证健康状态，失效则自动轮转"""
+    providers, all_creds = _auth_list()
+    if not providers:
+        print("⚠️ 无活跃凭证，尝试同步恢复...")
+        run_sync_again()
+        return
+    
+    # 获取飞书表格记录用于健康检查
+    tok = get_feishu_token()
+    records = get_records(tok)
+    
+    # 遍历所有 providers 的活跃凭证
+    for prov_name, prov_info in providers.items():
+        active_cred = prov_info.get('active')
+        if not active_cred:
+            print(f"⚠️ {prov_name} 无活跃凭证，跳过")
+            continue
+        
+        # 在飞书表格中找到对应的凭证记录
+        cred_record = None
+        for rec in records:
+            fields = rec['fields']
+            label = extract_text(fields.get('Label', '')).strip()
+            provider = extract_text(fields.get('Provider', '')).strip()
+            # hermes 返回 custom:ark，飞书写 ARK，需要归一化
+            prov_name_normalized = prov_name.replace('custom:', '', 1).lower()
+            if label == active_cred['label'] and provider.lower() == prov_name_normalized:
+                cred_record = fields
+                break
+        
+        if not cred_record:
+            print(f"⚠️ {prov_name}#{active_cred['label']} 未找到对应记录，跳过")
+            continue
+        
+        # 获取凭证信息
+        api_key = extract_text(cred_record.get('API Key', '')).strip()
+        base_url = extract_text(cred_record.get('Base URL', '')).strip()
+        model = extract_text(cred_record.get('模型', '')).strip()
+        
+        # 健康检查
+        print(f"🔍 检查 {prov_name}#{active_cred['label']} 健康状态...", end=" ")
+        ok, status, err = test_key(api_key, base_url, model)
+        
+        if not ok:
+            print(f"❌ {status}")
+            # 凭证失效，检查是否可以轮转
+            prov_creds = prov_info.get('creds', [])
+            if len(prov_creds) > 1:
+                print(f"🔄 活跃凭证 {active_cred['label']} 失效，移除中...")
+                _remove_cred(prov_name, active_cred['idx'])
+                time.sleep(1)
+                # 验证切换
+                new_providers, _ = _auth_list()
+                new_active = new_providers.get(prov_name, {}).get('active')
+                if new_active and new_active['label'] != active_cred['label']:
+                    print(f"✅ 已切换至: {new_active['label']}")
+                else:
+                    print("⚠️ 切换未生效，需检查 Provider 凭证池")
+            else:
+                print(f"⚠️ {prov_name} 仅剩 1 个凭证，无法轮转")
+        else:
+            print(f"✅ {status}")
+    
+    print("✅ 所有 Provider 健康检查完成")
+
+
+def _auth_list():
+    """解析 hermes auth list 输出，返回所有 providers 和所有凭证"""
+    r = subprocess.run(["hermes", "auth", "list"], capture_output=True, text=True, timeout=15)
+    if r.returncode != 0: return {}, []
+    providers = {}  # {provider_name: {'active': cred_info, 'creds': [cred_info]}}
+    all_creds = []
+    current_provider = None
+    for line in r.stdout.splitlines():
+        m = re.match(r"^(\S+)\s+\(\d+ credentials\)", line.strip())
+        if m:
+            current_provider = m.group(1)
+            providers[current_provider] = {'active': None, 'creds': []}
+            continue
+        m2 = re.match(r"#(\d+)\s+(.+?)\s+api_key\s+(\S+)\s*(←)?", line.strip())
+        if m2 and current_provider:
+            idx, label, source = m2.group(1), m2.group(2), m2.group(3)
+            is_active = m2.group(4) is not None
+            cred_info = {"provider": current_provider, "idx": idx, "label": label, "active": is_active}
+            providers[current_provider]['creds'].append(cred_info)
+            all_creds.append(cred_info)
+            if is_active:
+                providers[current_provider]['active'] = cred_info
+    return providers, all_creds
+
+
+def _remove_cred(provider, idx):
+    r = subprocess.run(["hermes", "auth", "remove", provider, str(idx)], capture_output=True, text=True, timeout=15)
+    return r.returncode == 0
+
+
+def run_sync_again():
+    """再次执行同步以恢复凭证"""
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    subprocess.run([sys.executable, os.path.join(script_dir, "sync_credential_pool.py")], capture_output=True, text=True, timeout=120)
+
 
 if __name__ == "__main__": sync()
