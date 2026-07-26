@@ -14,7 +14,7 @@
 - 明确修改范围
 - 不允许修改代码
 
-### Step 3: MiMo Code 执行
+### Step 3: Codex CLI 执行
 - 按批准方案修改代码
 - 不得自行增减功能
 
@@ -37,5 +37,5 @@ Step 1 → Step 2 → Step 3 → Step 4
 | 工具 | 职责 |
 |------|------|
 | Codex CLI | 审查、方案、复审 |
-| MiMo Code | 执行修改 |
+| Codex CLI | 执行修改 |
 | Hermes | 调度和项目管理 |

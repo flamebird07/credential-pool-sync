@@ -80,6 +80,8 @@ hermes cron create credential-pool-sync --schedule "*/30 * * * *" --script cron_
 | Base URL | 文本 | API 端点地址 | ✅ |
 | 优先级 | 数字 | 优先级（0=最高） | |
 
+优先级数值越小，凭证同步顺序越靠前；未填写或无法解析时按 999 处理。同一 Provider 和 Label 的重复记录仅保留优先级最高（数值最小）的一条，优先级相同时保留飞书原始顺序最靠前的一条。
+
 ## 安全性说明
 
 | 风险 | 缓解措施 |

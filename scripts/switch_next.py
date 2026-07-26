@@ -6,9 +6,9 @@ def auth_list():
     if r.returncode != 0: return None, None, None
     provider = None; active = None; all_creds = []
     for line in r.stdout.splitlines():
-        m = re.match(r"^(\S+)\s+\(\d+ credentials\)", line.strip())
+        m = re.match(r"^(\S+)\s+\(\d+ credentials\)", line)
         if m: provider = m.group(1); continue
-        m2 = re.match(r"#(\d+)\s+(\S+)\s+api_key\s+(\S+)\s*(←)?", line.strip())
+        m2 = re.match(r"^\s+#(\d+)\s+(.+?)\s+api_key\s+(\S+)\s*(←)?", line)
         if m2 and provider:
             idx, label, source = m2.group(1), m2.group(2), m2.group(3)
             is_active = m2.group(4) is not None
@@ -34,7 +34,9 @@ def main():
     
     # Step 1: Sync first to get fresh credentials
     print("同步飞书表格...")
-    run_sync()
+    if not run_sync():
+        print("ERROR: 同步失败", file=sys.stderr)
+        sys.exit(1)
     
     # Step 2: Find provider with multiple credentials
     provider, active, all_creds = auth_list()

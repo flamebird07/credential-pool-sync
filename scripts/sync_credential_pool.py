@@ -2,6 +2,7 @@
 """凭证池同步脚本 v3.0 — 使用 hermes auth add CLI 而非直接写 auth.json"""
 
 import json, os, re, subprocess, urllib.request, time, sys
+import logging
 from pathlib import Path
 
 def load_env():
@@ -9,8 +10,10 @@ def load_env():
     if env_path.exists():
         with open(env_path) as f:
             for line in f:
-                line = line.strip()
-                if line and not line.startswith('#') and '=' in line:
+                line = line.rstrip('\n')
+                if not line.lstrip() or line.lstrip().startswith('#'):
+                    continue
+                if '=' in line:
                     k, v = line.split('=', 1)
                     os.environ.setdefault(k.strip(), v.strip())
 load_env()
@@ -26,6 +29,8 @@ S_INVALID = "\u274c \u65e0\u6548"
 S_RATE_LIMITED = "\u26a0\ufe0f \u9650\u6d41"
 
 PROVIDER_MAP = {"ARK": "ARK", "longcat": "longcat", "xiaomi": "xiaomi", "Z.AI": "Z.AI", "DeepSeek": "DeepSeek"}
+logger = logging.getLogger(__name__)
+_last_auth_list_cache = ([], {})
 
 def get_feishu_token():
     d = json.dumps({"app_id": FEISHU_APP_ID, "app_secret": FEISHU_APP_SECRET}).encode()
@@ -87,12 +92,48 @@ def sync():
     print(f"\n\U0001f4cb {len(rs)} \u6761\u8bb0\u5f55")
     for r in rs: update_status(tok, r["record_id"], S_UNVERIFIED)
     print("  \u2705 \u6807\u8bb0\u4e3a \u23f3 \u672a\u9a8c\u8bc1")
-    vc, ic = 0, 0
-    for r in rs:
+    records = []
+    for original_index, r in enumerate(rs):
         f = r["fields"]; rid = r["record_id"]; pr = extract_text(f.get("Provider","")).strip()
         lb = extract_text(f.get("Label","")).strip(); ak = extract_text(f.get("API Key","")).strip()
         bu = extract_text(f.get("Base URL","")).strip(); mn = extract_text(f.get("\u6a21\u578b","")).strip()
+        priority_raw = f.get("优先级", None)
+        try:
+            priority = int(extract_text(priority_raw)) if priority_raw is not None else 999
+        except (ValueError, TypeError):
+            priority = 999
         pn = PROVIDER_MAP.get(pr)
+        records.append({
+            "record_id": rid,
+            "provider": pr,
+            "provider_name": pn,
+            "label": lb,
+            "api_key": ak,
+            "base_url": bu,
+            "model": mn,
+            "priority": priority,
+            "original_index": original_index,
+        })
+
+    deduplicated = {}
+    for record in records:
+        key = (record["provider"], record["label"])
+        existing = deduplicated.get(key)
+        if existing is None or record["priority"] < existing["priority"]:
+            deduplicated[key] = record
+    records = sorted(
+        deduplicated.values(),
+        key=lambda record: (
+            record["provider"],
+            record["priority"],
+            record["original_index"],
+        ),
+    )
+
+    vc, ic = 0, 0
+    for record in records:
+        rid = record["record_id"]; pr = record["provider"]; pn = record["provider_name"]
+        lb = record["label"]; ak = record["api_key"]; bu = record["base_url"]; mn = record["model"]
         if not pn: print(f"\n  \u23ed\ufe0f [{lb or pr}] \u8df3\u8fc7: \u672a\u77e5"); update_status(tok, rid, S_INVALID, f"\u672a\u77e5: {pr}"); continue
         if not ak or ak == "***": print(f"\n  \u23ed\ufe0f [{lb or pn}] \u8df3\u8fc7"); update_status(tok, rid, S_INVALID, "\u7f3a\u5c11"); continue
         print(f"\n  \U0001f50d [{lb or pn}] \u9a8c\u8bc1...", end=" "); sys.stdout.flush()
@@ -206,12 +247,12 @@ def _auth_list():
     all_creds = []
     current_provider = None
     for line in r.stdout.splitlines():
-        m = re.match(r"^(\S+)\s+\(\d+ credentials\)", line.strip())
+        m = re.match(r"^(\S+)\s+\(\d+ credentials\)", line)
         if m:
             current_provider = m.group(1)
             providers[current_provider] = {'active': None, 'creds': []}
             continue
-        m2 = re.match(r"#(\d+)\s+(.+?)\s+api_key\s+(\S+)\s*(←)?", line.strip())
+        m2 = re.match(r"^\s+#(\d+)\s+(.+?)\s+api_key\s+(\S+)\s*(←)?", line)
         if m2 and current_provider:
             idx, label, source = m2.group(1), m2.group(2), m2.group(3)
             is_active = m2.group(4) is not None
