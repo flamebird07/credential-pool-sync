@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v2.0 — 含连通性验证 + 状态回写"""
+"""凭证池同步脚本 v7.3.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
 import yaml
+from urllib.parse import urlparse
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -47,6 +48,7 @@ def load_feishu_credentials():
             config.get("feishu"),
             (config.get("secrets") or {}).get("feishu") if isinstance(config.get("secrets"), dict) else None,
             (config.get("channels") or {}).get("feishu") if isinstance(config.get("channels"), dict) else None,
+            ((config.get("platforms") or {}).get("feishu") or {}).get("extra") if isinstance(config.get("platforms"), dict) else None,
         ]
         for candidate in candidates:
             if isinstance(candidate, dict):
@@ -61,10 +63,30 @@ def load_feishu_credentials():
         "or configure secrets.feishu.app_id and secrets.feishu.app_secret in Hermes config.yaml."
     )
 
-S_U = "\u26a0\ufe0f \u4e0d\u53ef\u7528"
-S_A = "\u2705 \u6b63\u5e38"
-S_I = "\u274c \u65e0\u6548"
-S_R = "\u26d4 \u9650\u6d41"
+S_U = "⚠️ 不可用"
+S_A = "✅ 正常"
+S_I = "❌ 无效"
+S_R = "⛔ 限流"
+S_C = "🔄 检查中"
+
+# A health-checked rebuild may replace the existing pool only when it retains
+# at least this fraction, unless unavailable results are not the majority.
+STANDARD_PROVIDERS = frozenset({'openai', 'anthropic', 'deepseek', 'moonshot', 'dashscope', 'z.ai'})
+HERMES_CUSTOM_PROVIDER = "custom"
+
+def _hermes_pool_key(provider):
+    pk = str(provider or "").strip().lower().replace(" ", "-")
+    if pk not in STANDARD_PROVIDERS:
+        pk = f"custom:{pk}"
+    return pk
+
+def _strip_version_suffix(url):
+    u = url.rstrip("/")
+    if u.endswith("/v1") or u.endswith("/v3"):
+        return u[:-3].rstrip("/")
+    return u
+
+MIN_POOL_RETENTION_RATIO = 0.5
 
 def get_agent_name():
     """获取 Hermes Agent 名称，优先从 config.yaml 读取，其次从 hostname 映射。"""
@@ -100,6 +122,44 @@ def status_remove(s, name):
     names = [agent for agent in agents(s) if agent != name]
     return f"🔄 {'+'.join(names)}使用中" if names else S_A
 
+def health_status(is_valid, status, error=None):
+    """Map a probe result to the health field; ownership never belongs here."""
+    if is_valid:
+        return S_A
+    detail = f"{status or ''} {error or ''}"
+    if status == S_R or "限流" in detail or "额度" in detail:
+        return S_R
+    if status == S_I or "401" in detail or "403" in detail or "无效" in detail:
+        return S_I
+    return S_U
+
+def _usage_names(note):
+    match = re.search(r"🔄\s+(.+?)使用中", str(note or ""))
+    return match.group(1).split("+") if match else []
+
+def usage_remove(note, name):
+    names = [agent for agent in _usage_names(note) if agent != name]
+    # 移除现有的使用信息标记
+    detail = re.sub(r"\s*\|\s*🔄\s+.+?使用中", "", str(note or "")).strip(" |")
+    # 重新构建备注，移除空字符串
+    parts = [p.strip() for p in detail.split("|") if p.strip()]
+    if names:
+        return f"{' | '.join(parts)} | 🔄 {'+'.join(names)}使用中"
+    else:
+        return " | ".join(parts) if parts else ""
+
+def usage_add(note, name):
+    names = [agent for agent in _usage_names(note) if agent != name] + [name]
+    # 移除现有的使用信息标记
+    detail = re.sub(r"\s*\|\s*🔄\s+.+?使用中", "", str(note or "")).strip(" |")
+    # 重新构建备注，移除空字符串
+    parts = [p.strip() for p in detail.split("|") if p.strip()]
+    marker = f"🔄 {'+'.join(dict.fromkeys(names))}使用中"
+    if parts:
+        return f"{' | '.join(parts)} | {marker}"
+    else:
+        return marker
+
 def gt():
     app_id, app_secret = load_feishu_credentials()
     d = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
@@ -120,37 +180,98 @@ def gr(t):
 
 _UNSET = object()
 
-def us(t, rid, s=None, n=_UNSET, *, note=_UNSET):
+def us(t, rid, s=None, note=None, provider=None, base_url=None):
     h = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
     f = {}
     if s is not None:
-        f["\u72b6\u6001"] = s
-    if note is not _UNSET:
-        f["\u5907\u6ce8"] = note
-    elif n is not _UNSET:
-        f["\u5907\u6ce8"] = n
+        f["状态"] = s
+    if note is not None:
+        f["备注"] = note
+
+    if provider is not None:
+        f["Provider"] = provider
+    if base_url is not None:
+        f["Base URL"] = base_url
     if not f:
         return
     request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
 
-def clear_current(token, keep_id=None):
-    """从凭证状态中清除本机 Agent，保留其他 Agent。"""
-    agent_name = get_agent_name()
-    for r in gr(token):
-        if r.get("record_id") != keep_id:
-            status = r.get("fields", {}).get("状态", "")
-            new_status = status_remove(status, agent_name)
-            if new_status != status:
-                us(token, r["record_id"], new_status)
-
 def endpoint_candidates(base_url):
     base = str(base_url or "").strip().rstrip("/")
-    suffixes = ("/v1/chat/completions", "/chat/completions", "/v1/messages", "/messages")
-    for suffix in suffixes:
-        if base.lower().endswith(suffix):
-            base = base[:-len(suffix)].rstrip("/")
+    suffixes = (
+        "/v3/chat/completions", "/v1/chat/completions", "/chat/completions",
+        "/v3/messages", "/v1/messages", "/messages",
+    )
+    base = _strip_endpoint_suffix(base)
+    for version in ("/v3", "/v1"):
+        if base.lower().endswith(version):
+            base = base[:-len(version)].rstrip("/")
             break
     return [f"{base}{suffix}" for suffix in suffixes]
+
+
+def _strip_endpoint_suffix(value):
+    value = str(value or "").strip().rstrip("/")
+    for suffix in (
+        "/v1/chat/completions", "/v3/chat/completions", "/chat/completions",
+        "/v1/messages", "/v3/messages", "/messages",
+    ):
+        if value.lower().endswith(suffix):
+            return value[:-len(suffix)].rstrip("/")
+    return value
+
+
+def endpoint_base_url(endpoint):
+    """Convert a probed endpoint back to the base URL stored by Hermes."""
+    value = str(endpoint or "").rstrip("/")
+    for suffix in ("/chat/completions", "/messages"):
+        if value.lower().endswith(suffix):
+            return value[:-len(suffix)].rstrip("/")
+    return value
+
+
+def detect_provider(base_url):
+    """Infer the provider from a URL when the Feishu provider field is empty."""
+    host = (urlparse(str(base_url or "")).hostname or "").lower()
+    mapping = (
+        ("ark.cn-beijing.volces.com", "ARK"),
+        ("open.bigmodel.cn", "Z.AI"),
+        ("api.openai.com", "OPENAI"),
+        ("api.anthropic.com", "ANTHROPIC"),
+        ("api.deepseek.com", "DEEPSEEK"),
+        ("api.moonshot.cn", "MOONSHOT"),
+        ("dashscope.aliyuncs.com", "DASHSCOPE"),
+    )
+    for marker, provider in mapping:
+        if marker in host:
+            return provider
+    return None
+
+
+def try_url_variants(base_url):
+    """Return base URL variants used for endpoint discovery and self-healing."""
+    base = _strip_endpoint_suffix(base_url)
+    if not base:
+        return []
+    # Records may contain a base URL or a complete endpoint. Probe both common
+    # API generations and both schemes for provider-neutral self-healing.
+    parsed = urlparse(base if "://" in base else f"https://{base}")
+    root = parsed._replace(path=parsed.path.rstrip("/"))
+    path = root.path
+    if path.lower().endswith(("/v1", "/v3")):
+        root = root._replace(path=path[:-3].rstrip("/"))
+    path_variants = [root._replace(path=f"{root.path.rstrip('/')}{version}").geturl().rstrip("/") for version in ("", "/v3", "/v1")]
+    schemes = ("https", "http")
+    variants = [urlparse(candidate)._replace(scheme=scheme).geturl().rstrip("/")
+                for candidate in path_variants for scheme in schemes]
+
+    if "ark.cn-beijing.volces.com" in (parsed.hostname or "").lower():
+        variants.extend(
+            f"{scheme}://{parsed.netloc}{suffix}"
+            for scheme in schemes
+            for suffix in ("/api/plan/v3", "/api/coding/v3", "/api/plan/v1", "/api/v3")
+        )
+    return list(dict.fromkeys(variants))
 
 
 def model_limits(model_name):
@@ -164,7 +285,7 @@ def model_limits(model_name):
 def tk(p, ak, bu, m):
     if not ak or not bu:
         return False, S_I, "缺少必填", ""
-    candidates = endpoint_candidates(bu)
+    candidates = [endpoint for variant in try_url_variants(bu) for endpoint in endpoint_candidates(variant)]
     last_error = None
     for endpoint in candidates:
         anthropic = endpoint.endswith("/messages")
@@ -181,8 +302,16 @@ def tk(p, ak, bu, m):
             payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}
         request = urllib.request.Request(endpoint, data=json.dumps(payload).encode(), headers=headers)
         try:
-            request_with_retry(request, timeout=8, max_retries=2)
-            return True, S_A, None, endpoint.rstrip("/")
+            with urllib.request.urlopen(request, timeout=8) as response:
+                code = response.getcode()
+            if 200 <= code < 300:
+                return True, S_A, None, endpoint.rstrip("/")
+            if code == 429:
+                return False, S_R, "HTTP 429: rate limited", endpoint.rstrip("/")
+            if code in (401, 403):
+                return False, S_I, f"HTTP {code}: Key invalid", endpoint.rstrip("/")
+            last_error = f"HTTP {code}"
+            continue
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
                 return False, S_R, "额度已用完", endpoint.rstrip("/")
@@ -192,7 +321,7 @@ def tk(p, ak, bu, m):
                 last_error = f"HTTP {exc.code}"
                 continue
             if 400 <= exc.code < 500:
-                return True, S_A, None, endpoint.rstrip("/")
+                return False, S_U, f"HTTP {exc.code}", endpoint.rstrip("/")
             return False, S_U, f"HTTP {exc.code}: 服务暂不可用", endpoint.rstrip("/")
         except (urllib.error.URLError, OSError) as exc:
             last_error = f"连接失败: {str(exc)[:80]}"
@@ -254,9 +383,9 @@ def _parse_fallback_list(output):
         })
     return entries
 
-def cleanup_fallback_chain(records):
+def cleanup_fallback_chain(records, health_results=None):
     """Remove fallback providers whose base_url no longer exists in Feishu records."""
-    print(f"\n{'='*50}\n\U0001f9f9 \u6e05\u7406 fallback chain\n{'='*50}")
+    print(f"\n{'='*50}\n🧹 清理 fallback chain\n{'='*50}")
     feishu_base_urls = set()
     for r in records:
         fields = r.get("fields") or {}
@@ -265,30 +394,30 @@ def cleanup_fallback_chain(records):
             feishu_base_urls.add(bu)
 
     try:
-        res = subprocess.run(["hermes", "fallback", "list"], capture_output=True, text=True, timeout=30)
+        res = subprocess.run(["hermes", "fallback", "list"], capture_output=True, text=True, timeout=30, encoding="utf-8", errors="replace")
     except FileNotFoundError:
-        print("  \u26a0\ufe0f hermes \u547d\u4ee4\u672a\u627e\u5230\uff0c\u8df3\u8fc7 fallback \u6e05\u7406")
+        print("  ⚠️  hermes 命令未找到，跳过 fallback 清理")
         return
     except Exception as e:
-        print(f"  \u26a0\ufe0f \u83b7\u53d6 fallback chain \u5931\u8d25: {e}")
+        print(f"  ⚠️  获取 fallback chain 失败: {e}")
         return
 
     if res.returncode != 0:
-        print(f"  \u26a0\ufe0f \u65e0\u6cd5\u83b7\u53d6 fallback chain: {res.stderr.strip()}")
+        print(f"  ⚠️  无法获取 fallback chain: {res.stderr.strip()}")
         return
 
     entries = _parse_fallback_list(res.stdout)
     if not entries:
-        print("  \u65e0 fallback \u914d\u7f6e")
+        print("  无 fallback 配置")
         return
 
     stale = [e for e in entries if e["base_url"] and e["base_url"] not in feishu_base_urls]
     if not stale:
-        print("  fallback chain \u4e0e\u98de\u4e66\u8bb0\u5f55\u4e00\u81f4")
+        print("  fallback chain 与飞书记录一致")
         return
 
     for e in sorted(stale, key=lambda x: x["index"], reverse=True):
-        print(f"  \u79fb\u9664 stale fallback #{e['index']+1}: {e['model']} [{e['base_url']}]")
+        print(f"  🗑️  移除 stale fallback #{e['index']+1}: {e['model']} [{e['base_url']}]")
         try:
             rm = subprocess.run(
                 ["hermes", "fallback", "remove"],
@@ -296,14 +425,202 @@ def cleanup_fallback_chain(records):
                 text=True,
                 capture_output=True,
                 timeout=30,
+                encoding="utf-8",
+                errors="replace",
             )
         except Exception as e2:
-            print(f"    \u79fb\u9664\u5931\u8d25: {e2}")
+            print(f"    ❌ 移除失败: {e2}")
             continue
         if rm.returncode != 0:
-            print(f"    \u79fb\u9664\u5931\u8d25: {rm.stderr.strip()}")
+            print(f"    ❌ 移除失败: {rm.stderr.strip()}")
 
-    print("  fallback chain \u6e05\u7406\u5b8c\u6210")
+    print("  fallback chain 清理完成")
+    
+    # 清理 429 配置
+
+
+# 视觉模型关键词（max_tokens 限制 1024，不适合文本对话）
+_VISION_KEYWORDS = ("glm-4v", "glm-4.6v", "vision", "-v-flash", "vl-")
+
+# 已知无效模型 (ARK 上不存在或返回 404)
+_INVALID_MODELS = frozenset({
+    "deepseek-r1-distill-qwen-7b-250120",  # ARK 上不存在此模型
+})
+
+
+def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
+    """同步 fallback_providers：将飞书表格中所有非视觉文本模型加入 fallback 链。
+
+    核心原则：
+    - ARK 只是来源，不是账号，每个模型的容量是独立的
+    - 飞书里每条记录的容量都是独立的
+    - 所有非视觉模型都应加入 fallback 链，不遗漏
+    - GPT 放最后（quota 经常耗尽）
+    """
+    healed_urls = healed_urls or {}
+    entries = []
+    seen = set()
+    gpt_entries = []
+    
+    # 读取当前主模型，避免重复添加
+    current_main_model = None
+    try:
+        with open(get_runtime_config_path(), encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        current_model = config.get("model") or {}
+        if isinstance(current_model, dict):
+            current_main_model = (
+                str(current_model.get("api_key", "") or "").strip(),
+                str(current_model.get("base_url", "") or "").strip().lower().rstrip("/"),
+                str(current_model.get("default", "") or "").strip(),
+            )
+    except Exception:
+        pass
+
+    for r in raw_records:
+        rec = _normalise_record(r)
+        if rec is None:
+            continue
+        model = rec.get("model", "")
+        base_url = rec.get("base_url", "")
+        api_key = rec.get("api_key", "")
+        original_identity = (api_key, base_url, model)
+        if original_identity in healed_urls:
+            base_url = healed_urls[original_identity]
+        
+        # 跳过视觉模型
+        name_lower = model.lower()
+        if any(v in name_lower for v in _VISION_KEYWORDS):
+            continue
+        
+        # 跳过已知无效模型
+        if name_lower in _INVALID_MODELS:
+            continue
+        
+        # 跳过健康检查确认无效的模型；限流模型仍保留在 fallback 链中
+        identity = (api_key, base_url, model)
+        if health_results is not None:
+            result = health_results.get(identity)
+            if result and not result[0]:
+                status = result[1]
+                error_text = str(result[2] or "").lower()
+                if status == S_I or (
+                    status == S_R
+                    and ("quota" in error_text or "exhausted" in error_text)
+                ):
+                    continue
+            
+        # 跳过当前主模型（避免重复）
+        if current_main_model and identity == current_main_model:
+            continue
+
+        # 去重: (model, base_url, api_key)
+        key = (model.lower(), base_url, api_key)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        entry = {
+            "provider": HERMES_CUSTOM_PROVIDER,
+            "model": model,
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+
+        # GPT 放最后（quota 经常耗尽）
+        if "openai.com" in base_url:
+            gpt_entries.append(entry)
+        else:
+            entries.append(entry)
+
+    entries.extend(gpt_entries)
+
+    # 重新读取 config.yaml（避免覆盖其他进程的修改）并写入 fallback_providers
+    runtime_config = get_runtime_config_path()
+    with locked_path(runtime_config):
+        with open(runtime_config, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+
+        old_count = len(config.get("fallback_providers") or [])
+        config["fallback_providers"] = entries
+
+        tmp = runtime_config.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, runtime_config)
+        finally:
+            if tmp.exists():
+                tmp.unlink()
+
+    if len(entries) != old_count:
+        print(f"  📈 fallback_providers: {old_count} → {len(entries)} (含 {len(gpt_entries)} GPT)")
+    else:
+        print(f"  ✅ fallback_providers: {len(entries)} 个模型 (含 {len(gpt_entries)} GPT)")
+
+
+def cleanup_custom_providers():
+    """Remove custom provider endpoints that are no longer used by the runtime model or fallback chain."""
+    runtime_config = get_runtime_config_path()
+    with locked_path(runtime_config):
+        with open(runtime_config, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        if not isinstance(config, dict):
+            return
+
+        active_base_urls = set()
+
+        current_model = config.get("model") or {}
+        if isinstance(current_model, dict):
+            base_url = str(current_model.get("base_url", "") or "").strip().lower().rstrip("/")
+            if base_url:
+                active_base_urls.add(base_url)
+
+        fallback_providers = config.get("fallback_providers") or []
+        if isinstance(fallback_providers, list):
+            for entry in fallback_providers:
+                if not isinstance(entry, dict):
+                    continue
+                base_url = str(entry.get("base_url", "") or "").strip().lower().rstrip("/")
+                if base_url:
+                    active_base_urls.add(base_url)
+
+        active_stripped = {_strip_version_suffix(url) for url in active_base_urls}
+
+        custom_providers = config.get("custom_providers") or []
+        if not isinstance(custom_providers, list):
+            return
+
+        kept = []
+        removed = 0
+        for entry in custom_providers:
+            if not isinstance(entry, dict):
+                removed += 1
+                continue
+            base_url = str(entry.get("base_url", "") or "").strip().lower().rstrip("/")
+            if base_url and base_url not in active_base_urls and _strip_version_suffix(base_url) not in active_stripped:
+                removed += 1
+                print(f"  🗑️  custom_provider: {entry.get('name', '?')} [{base_url}] — stale")
+            else:
+                kept.append(entry)
+
+        if removed:
+            config["custom_providers"] = kept
+            tmp = runtime_config.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
+            try:
+                with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+                    yaml.safe_dump(config, f, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, runtime_config)
+            finally:
+                if tmp.exists():
+                    tmp.unlink()
+            print(f"  📦 custom_providers: {len(kept) + removed} → {len(kept)} (removed {removed} stale)")
+        else:
+            print(f"  ✅ custom_providers: {len(custom_providers)} 条，无过期条目")
 
 
 def _priority(value):
@@ -312,15 +629,28 @@ def _priority(value):
     except (TypeError, ValueError):
         return 99
 
+
+def normalise_base_url(value):
+    """Return the canonical Hermes base URL for a credential record."""
+    base_url = str(value or "").strip().lower().rstrip("/")
+    if base_url == "https://ark.cn-beijing.volces.com/api/plan":
+        return "https://ark.cn-beijing.volces.com/api/plan/v1"
+    return base_url
+
+
 def _normalise_record(record):
     fields = record.get("fields") or {}
     provider = str(fields.get("Provider", "") or "").strip()
     label = str(fields.get("Label", "") or "").strip()
     api_key = str(fields.get("API Key", "") or "").strip()
-    base_url = str(fields.get("Base URL", "") or "").strip().lower().rstrip("/")
-    model = str(fields.get("\u6a21\u578b", "") or "").strip()
-    priority = _priority(fields.get("\u4f18\u5148\u7ea7", ""))
-    if not provider or not api_key or api_key == "***":
+    base_url = normalise_base_url(fields.get("Base URL", ""))
+    model = str(fields.get("模型", "") or "").strip()
+    priority = _priority(fields.get("优先级", ""))
+    # 反推 Provider：如果 Feishu 的 Provider 字段为空或为 "custom"，但从 URL 能推断出标准 Provider，则覆盖
+    inferred = detect_provider(base_url)
+    if inferred and (not provider or provider.lower() == "custom"):
+        provider = inferred
+    if not api_key or api_key == "***":
         return None
     return {
         "record_id": record.get("record_id", ""),
@@ -330,7 +660,7 @@ def _normalise_record(record):
         "base_url": base_url,
         "api_key": api_key,
         "priority": priority,
-        "status": str(fields.get("\u72b6\u6001", "") or "").strip(),
+        "status": str(fields.get("状态", "") or "").strip(),
     }
 
 def _read_existing_auth():
@@ -349,11 +679,14 @@ def _read_existing_auth():
     return existing
 
 
-def sync(skip_health_rotate=False):
-    print("="*50); print("\u51ed\u8bc1\u6c60\u540c\u6b65 v2.0"); print("="*50)
+def _sync_unlocked(skip_health_rotate=False):
+    print("="*50); print("凭证池同步 v7.2.0"); print("="*50)
     tok = gt()
-    rs = gr(tok); print(f"\n\U0001f4cb \u98de\u4e66: {len(rs)} \u6761")
-    fe, vc, ic, output_records, pending_updates = {}, 0, 0, [], []
+    rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
+    fe, vc, r_limit, ic, output_records, pending_updates = {}, 0, 0, 0, [], []
+    url_updates = []
+    healed_urls = {}
+    health_results = {} if not skip_health_rotate else None
     agent_name = get_agent_name()
     with open(get_runtime_config_path(), encoding="utf-8") as handle:
         current_config = yaml.safe_load(handle) or {}
@@ -370,49 +703,120 @@ def sync(skip_health_rotate=False):
         normalised = _normalise_record(r)
         if normalised is None:
             label = str(f.get("Label", "") or f.get("Provider", "") or "").strip()
-            print(f"\n  \u23ed\ufe0f [{label}] \u8df3\u8fc7")
+            print(f"\n  ⏭️  [{label}] 跳过")
             if not skip_health_rotate and rid:
-                pending_updates.append((rid, S_I, _UNSET))
+                pending_updates.append((rid, S_I, None))
             continue
         p = normalised["provider"]; l = normalised["label"]; ak = normalised["api_key"]
         bu = normalised["base_url"]; m = normalised["model"]; pr = normalised["priority"]
+        detected_provider = detect_provider(bu)
+        original_provider = str(f.get("Provider", "") or "").strip()
+        # 注意: 不要修改 api/plan → api/plan/v3
+        # 诊断证明 api/plan 配合 /v1/chat/completions 是正确的端点
+        # api/plan/v3 反而导致 404
         if skip_health_rotate:
             iv, s, e, _used_url = True, S_A, None, ""
         else:
-            print(f"\n  \U0001f504 [{l or p}] ...", end=" ")
+            print(f"\n  🔍 [{l or p}] ...", end=" ")
             iv, s, e, _used_url = tk(p, ak, bu, m)
-        if iv:
+            if iv:
+                healed_url = endpoint_base_url(_used_url)
+                if healed_url and healed_url != bu:
+                    healed_urls[(ak, bu, m)] = healed_url
+                    url_updates.append((rid, detected_provider or p, healed_url))
+                    normalised["base_url"] = healed_url
+                    bu = healed_url
+                if detected_provider and (
+                    not original_provider or original_provider.lower() == "custom"
+                ):
+                    url_updates.append((rid, detected_provider, bu))
+                    normalised["provider"] = detected_provider
+                    p = detected_provider
+        if health_results is not None:
+            health_results[(ak, bu, m)] = (iv, s, e, _used_url)
+        if s == S_R:
+            exhaustion_hint = str(e or "").lower()
+            if "额度已用完" in exhaustion_hint or "quota exhausted" in exhaustion_hint:
+                if not skip_health_rotate:
+                    print(f"  跳过已耗尽凭证，不加入凭证池")
+                continue
+        if iv or s == S_R:
             if not skip_health_rotate:
-                print(f"\U0001f504 {s}")
-                record_identity = (ak, bu, m)
-                if record_identity == current_identity:
-                    new_status = status_add(f.get("状态", ""), agent_name)
+                print(f"✅ {s}")
+                # 状态栏显示 Agent 使用信息，备注保留原始说明
+                if iv:
+                    if (ak, bu, m) == current_identity:
+                        new_status = status_add(f.get("状态", ""), agent_name)
+                    else:
+                        new_status = status_remove(f.get("状态", ""), agent_name)
                 else:
-                    new_status = status_remove(f.get("状态", ""), agent_name)
-                normalised["status"] = new_status
-                pending_updates.append((rid, new_status, "验证通过"))
-            vc += 1
+                    new_status = health_status(iv, s, e)
+                h_note = f.get("备注", "")
+                pending_updates.append((rid, new_status, h_note))
+            if iv:
+                vc += 1
+            elif s == S_R:
+                r_limit += 1
             output_records.append(normalised)
-            eid = f"sync-{(m or l).lower().replace(' ', '-')}"
-            pk = f"custom:{p.strip().lower().replace(' ', '-')}"
-            fe.setdefault(pk, []).append({"id": eid, "label": l or m, "provider": p, "model": m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "access_token": ak, "api_key": ak, "last_status": "active", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
+            rid_full = r.get("record_id", "")
+            eid = f"sync-{rid_full}" if rid_full else f"sync-{uuid.uuid4().hex[:12]}"
+            pk = _hermes_pool_key(p)
+            hermes_provider = HERMES_CUSTOM_PROVIDER
+            fe.setdefault(pk, []).append({"id": eid, "label": l or m, "provider": hermes_provider, "model": m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "access_token": ak, "api_key": ak, "last_status": "active" if iv else "rate_limited", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
         else:
-            new_status = status_remove(f.get("状态", ""), agent_name)
-            normalised["status"] = new_status
-            note = e if e else "验证失败"
-            print(f"\u274c {s}"); ic += 1
-            pending_updates.append((rid, new_status, note))
+            # 健康检查失败时，设置正确的健康状态，从状态栏移除当前 Agent
+            new_status = health_status(False, s, e)
+            h_note = f.get("备注", "")
+            print(f"❌ {s}"); ic += 1
+            if s == S_U:
+                h_note = next((value for key, value in f.items() if "敞" in str(key)), h_note)
+            pending_updates.append((rid, new_status, h_note))
         if not skip_health_rotate:
             time.sleep(0.3)
-    print(f"\n{'='*50}\n\u2705 {vc} \u6709\u6548 | \u274c {ic} \u65e0\u6548")
+    print(f"\n{'='*50}\n✅ {vc} 有效 | ⛔ {r_limit} 限流 | ❌ {ic} 无效")
     AUTH_JSON.parent.mkdir(parents=True, exist_ok=True)
     with locked_path(AUTH_JSON):
         ex = _read_existing_auth()
-        ex["credential_pool"] = {}
+        existing_pool = ex.get("credential_pool") or {}
+        old_pool_count = (
+            sum(len(entries) for entries in existing_pool.values() if isinstance(entries, list))
+            if isinstance(existing_pool, dict)
+            else 0
+        )
+
+        candidate_pool = {}
         for pv, es in fe.items():
             es.sort(key=lambda x: x.get("priority", 99))
-            ex["credential_pool"][pv] = es
-        ex["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+            candidate_pool[pv] = es
+        new_pool_count = sum(len(entries) for entries in candidate_pool.values())
+
+        checked_count = len(health_results) if health_results is not None else 0
+        unavailable_count = (
+            sum(
+                1
+                for result in health_results.values()
+                if not result[0] and result[1] == S_U
+            )
+            if health_results is not None
+            else 0
+        )
+        preserve_existing_pool = (
+            old_pool_count > 0
+            and new_pool_count < old_pool_count * MIN_POOL_RETENTION_RATIO
+            and unavailable_count > checked_count * 0.5
+        )
+
+        if preserve_existing_pool:
+            print(
+                f"WARNING: 本次健康检查有 {unavailable_count}/{checked_count} 条不可用，"
+                f"候选凭证池将从 {old_pool_count} 缩减到 {new_pool_count}；"
+                "疑似网络故障，保留现有 credential_pool",
+                file=sys.stderr,
+            )
+        else:
+            ex["credential_pool"] = candidate_pool
+            ex["updated_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+
         temp_auth = AUTH_JSON.with_suffix(f".json.{uuid.uuid4().hex}.tmp")
         try:
             temp_auth.write_text(json.dumps(ex, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -423,45 +827,53 @@ def sync(skip_health_rotate=False):
         finally:
             if temp_auth.exists():
                 temp_auth.unlink()
+    # 同步 fallback_providers：所有非视觉模型加入 fallback 链
+    sync_fallback_providers(rs, health_results, healed_urls)
+    # 清理 custom_providers 中的过期端点
     if not skip_health_rotate:
-        clear_current(tok)
+        cleanup_custom_providers()
+    if not skip_health_rotate:
+        # clear_current(tok) 已移除：状态栏由每个记录自己维护
         for record_id, new_status, note in pending_updates:
-            if note is _UNSET:
+            if note is None or note == "":
                 us(tok, record_id, new_status)
             else:
                 us(tok, record_id, new_status, note=note)
+        for record_id, provider, base_url in url_updates:
+            us(tok, record_id, provider=provider, base_url=base_url)
     if fe:
-        print(f"\n\U0001f4dd auth.json: {list(ex['credential_pool'].keys())}, \u5171 {sum(len(v) for v in ex['credential_pool'].values())} \u4e2a")
+        print(f"\n\n📝 auth.json: {list(ex['credential_pool'].keys())}, 共 {sum(len(v) for v in ex['credential_pool'].values())} 个")
+    elif preserve_existing_pool:
+        print(f"\n\n⚠️ 无有效凭证，保留现有 credential_pool（{old_pool_count} 个）")
     else:
-        print("\n\u26a0\ufe0f \u65e0\u6709\u6548\u51ed\u8bc1\uff0c\u5df2\u6e05\u7a7a credential_pool")
+        print("\n\n⚠️ 无有效凭证，已清空 credential_pool")
     if not skip_health_rotate:
-        cleanup_fallback_chain(rs)
-    print(f"\n{'='*50}\n\u540c\u6b65\u5b8c\u6210 \u2705\n{'='*50}")
+        cleanup_fallback_chain(rs, health_results)
+    print(f"\n{'='*50}\n✅ 同步完成\n{'='*50}")
     output_records.sort(key=lambda item: item["priority"])
     print("__RECORDS__" + json.dumps(output_records, ensure_ascii=False, separators=(",", ":")))
 
+
+def sync(skip_health_rotate=False):
+    """Run one synchronization workflow at a time."""
+    workflow_lock = Path(__file__).with_suffix(".workflow.lock")
+    with locked_path(workflow_lock, timeout=120):
+        return _sync_unlocked(skip_health_rotate)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Sync the Feishu credential pool to Hermes.")
-    parser.add_argument(
-        "--skip-health-rotate",
-        action="store_true",
-        help="skip health checks, Feishu status writes, and fallback cleanup",
-    )
+    parser = argparse.ArgumentParser(description="同步飞书凭证池到 Hermes")
+    parser.add_argument("--skip-health-rotate", action="store_true", help="跳过健康检查，直接同步")
     args = parser.parse_args()
+
     try:
-        sync(skip_health_rotate=args.skip_health_rotate)
-    except urllib.error.HTTPError as exc:
-        print(f"ERROR: 网络请求失败（HTTP {exc.code}），响应已过滤", file=sys.stderr)
-        raise SystemExit(1)
-    except urllib.error.URLError as exc:
-        print(f"ERROR: 网络请求失败: {exc.reason}", file=sys.stderr)
-        raise SystemExit(1)
-    except json.JSONDecodeError as exc:
-        print(f"ERROR: JSON 解析失败: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        sync(args.skip_health_rotate)
+    except KeyboardInterrupt:
+        print("\n\n用户中断，同步已取消")
+        return 1
     except OSError as exc:
         print(f"ERROR: 文件操作失败: {exc}", file=sys.stderr)
         raise SystemExit(1)
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
