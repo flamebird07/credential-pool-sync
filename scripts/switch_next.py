@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.2.0 — 含飞书状态管理优化"""
+"""切换到下一个可用凭证 v7.3.0 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 import yaml
 from pathlib import Path
 from contextlib import contextmanager
+from sync_credential_pool import (
+    detect_provider,
+    normalise_base_url,
+    status_add,
+    status_remove,
+)
 
 BASE_TOKEN = "YedtbFYKZatu2QsGti9ch7xbnGc"
 TABLE_ID = "tblOSK9HexYVOHBW"
@@ -71,21 +77,6 @@ def get_agent_name():
     mapping = {"上款电脑": "周公瑾", "87": "周公瑾", "200": "甘宁", "50": "郭奉孝"}
     return mapping.get(hostname, f"unknown-{hostname}")
 
-def _usage_names(note):
-    match = re.search(r"🔄\s+(.+?)使用中", str(note or ""))
-    return match.group(1).split("+") if match else []
-
-def usage_remove(note, name):
-    names = [agent for agent in _usage_names(note) if agent != name]
-    detail = re.sub(r"\s*\|\s*🔄\s+.?使用中", "", str(note or "")).strip(" |")
-    return f"{detail} | 🔄 {'+'.join(names)}使用中" if names else detail
-
-def usage_add(note, name):
-    names = [agent for agent in _usage_names(note) if agent != name] + [name]
-    detail = re.sub(r"\s*\|\s*🔄\s+.?使用中", "", str(note or "")).strip(" |")
-    marker = f"🔄 {'+'.join(dict.fromkeys(names))}使用中"
-    return f"{detail} | {marker}" if detail else marker
-
 def gt():
     app_id, app_secret = load_feishu_credentials()
     d = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
@@ -136,9 +127,8 @@ _UNSET = object()
 
 def identity(record):
     return (
-        str(record.get("api_key", "") or "").strip(),
-        str(record.get("base_url", "") or "").strip().lower().rstrip("/"),
         str(record.get("model", "") or "").strip(),
+        str(record.get("api_key", "") or "").strip(),
     )
 
 def model_limits(model_name):
@@ -177,9 +167,12 @@ def _normalise_record(record):
     provider = str(fields.get("Provider", "") or "").strip()
     label = str(fields.get("Label", "") or "").strip()
     api_key = str(fields.get("API Key", "") or "").strip()
-    base_url = str(fields.get("Base URL", "") or "").strip().lower().rstrip("/")
+    base_url = normalise_base_url(fields.get("Base URL", ""))
     model = str(fields.get("模型", "") or "").strip()
     priority = _priority(fields.get("优先级", ""))
+    # 反推 Provider：如果 Provider 为空或为 custom，从 URL 推断
+    if not provider or provider.lower() == "custom":
+        provider = detect_provider(base_url) or provider
     if not provider or not api_key or api_key == "***":
         return None
     return {
@@ -204,19 +197,21 @@ def get_current_model_config():
     try:
         with open(get_runtime_config_path(), encoding="utf-8") as handle:
             config = yaml.safe_load(handle) or {}
-        model = config.get("model") or {}
-        if not isinstance(model, dict):
+        model_config = config.get("model") or {}
+        if not isinstance(model_config, dict):
             return None
-        return model
+        current = model_config.copy()
+        current["model"] = str(model_config.get("default", "") or "").strip()
+        return current
     except Exception:
         return None
 
 def first_healthy(records, current, token=None):
     old_record = None
-    if current:
-        old_identity = identity(current)
+    current_identity = identity(current) if current else None
+    if current_identity:
         for record in records:
-            if identity(record) == old_identity:
+            if identity(record) == current_identity:
                 old_record = record
                 break
 
@@ -246,9 +241,9 @@ def first_healthy(records, current, token=None):
 def ordered_candidates(records, current):
     """按优先级排序候选记录，当前记录排在最后"""
     current_identity = identity(current) if current else None
-    index = next((i for i, record in enumerate(records) if identity(record) == current_identity), None)
+    index = next((i for i, record in enumerate(records) if current_identity is not None and identity(record) == current_identity), None)
     ordered = records if index is None else records[index + 1:] + records[:index + 1]
-    return [record for record in ordered if identity(record) != current_identity]
+    return [record for record in ordered if current_identity is None or identity(record) != current_identity]
 
 def update_runtime_main_model(record):
     path = get_runtime_config_path()
@@ -257,12 +252,30 @@ def update_runtime_main_model(record):
             config = yaml.safe_load(handle) or {}
         if not isinstance(config, dict):
             raise ValueError("config.yaml 顶层必须是映射")
+
+        existing_model = config.get("model") or {}
+        if not isinstance(existing_model, dict):
+            existing_model = {}
+
+        record_provider = (
+            record.get("provider")
+            or detect_provider(record["base_url"])
+            or "custom"
+        )
+        existing_provider = str(existing_model.get("provider", "") or "").strip()
+        # 优先使用 record 的 provider，仅在 record 无法推断时才保留旧值
+        if not record.get("provider") and not detect_provider(record["base_url"]):
+            provider = existing_provider or "custom"
+        else:
+            provider = record_provider
+
         model = {
             "default": record["model"],
-            "provider": "custom",
+            "provider": provider,
             "base_url": record["base_url"].rstrip("/"),
             "api_key": record["api_key"],
         }
+
         limits = model_limits(record["model"])
         if limits:
             model["model_config"] = limits
@@ -278,6 +291,7 @@ def update_runtime_main_model(record):
             if temp.exists():
                 temp.unlink()
     return path
+
 
 @contextmanager
 def locked_path(target, timeout=10):
@@ -354,24 +368,31 @@ def endpoint_candidates(base_url):
             break
     return [f"{base}{suffix}" for suffix in suffixes]
 
+def rotate_once(records, rotation_lock):
+    """Read, select, health-check, and write while holding the rotation lock."""
+    with locked_path(rotation_lock):
+        current = get_current_model_config()
+        health_token = gt()
+        target = first_healthy(records, current, health_token)
+        path = update_runtime_main_model(target) if target is not None else None
+    return target, path
+
 def main():
     parser = argparse.ArgumentParser(description="切换到下一个可用凭证")
     parser.add_argument("--skip-sync", action="store_true", help="直接读取 auth.json，不同步飞书")
     args = parser.parse_args()
 
     try:
-        current = get_current_model_config()
+        rotation_lock = Path(__file__).with_name(".rotation")
         records = read_auth_records() if args.skip_sync else run_sync(full=False)
-        health_token = gt()
-        target = first_healthy(records, current, health_token)
+        target, path = rotate_once(records, rotation_lock)
         if target is None:
             print("没有可用候选，执行完整同步后再试一次...")
             records = run_sync(full=True)
-            target = first_healthy(records, current, health_token)
+            target, path = rotate_once(records, rotation_lock)
         if target is None:
             print("ERROR: 所有候选凭证均不可用", file=sys.stderr)
             return 1
-        path = update_runtime_main_model(target)
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, json.JSONDecodeError, yaml.YAMLError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
@@ -390,23 +411,23 @@ def main():
                     if r["record_id"] == target["old_record_id"]
                 )
                 old_status = old_r.get("fields", {}).get("状态", "")
-                # 移除旧凭证的使用信息
-                new_status = usage_remove(old_status, agent_name)
+                # 从状态栏移除旧凭证的 Agent 标记
+                new_status = status_remove(old_status, agent_name)
                 us(token, target["old_record_id"], new_status, note="额度已用完")
 
             new_r = next(
                 r for r in gr(token)
                 if r["record_id"] == target["record_id"]
             )
-            # 添加新凭证的使用信息，不覆盖健康状态
+            # 在状态栏添加新凭证的 Agent 标记
             current_status = new_r.get("fields", {}).get("状态", "")
-            new_note = usage_add(new_r.get("fields", {}).get("备注", ""), agent_name)
-            us(token, target["record_id"], current_status, note=new_note)
+            new_status = status_add(current_status, agent_name)
+            us(token, target["record_id"], new_status, note="验证通过")
         except Exception as exc:
             print(f"WARNING: 回写飞书状态失败: {exc}", file=sys.stderr)
 
     try:
-        run_sync(full=True)
+        pass  # The switch is already complete; do not perform a second sync.
     except Exception as exc:
         print(f"WARNING: 切换后的完整同步失败: {exc}", file=sys.stderr)
 

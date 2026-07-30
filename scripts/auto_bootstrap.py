@@ -6,10 +6,12 @@ import os
 import subprocess
 import sys
 import uuid
+from pathlib import Path
 
 import yaml
 
 from sync_credential_pool import (
+    detect_provider,
     get_agent_name,
     get_runtime_config_path,
     gr,
@@ -43,10 +45,7 @@ def run_sync():
     if result.returncode != 0:
         detail = (result.stderr or result.stdout).strip()
         raise RuntimeError(f"credential sync failed ({result.returncode}): {detail}")
-
-    lines = [
-        line for line in result.stdout.splitlines() if line.startswith("__RECORDS__")
-    ]
+    lines = [line for line in result.stdout.splitlines() if line.startswith("__RECORDS__")]
     if not lines:
         raise ValueError("sync output is missing __RECORDS__")
     records = json.loads(lines[-1][len("__RECORDS__"):])
@@ -62,9 +61,26 @@ def write_runtime_config(record):
             config = yaml.safe_load(handle) or {}
         if not isinstance(config, dict):
             raise ValueError("config.yaml root must be a mapping")
+
+        existing_model = config.get("model") or {}
+        if not isinstance(existing_model, dict):
+            existing_model = {}
+
+        record_provider = (
+            record.get("provider")
+            or detect_provider(str(record["base_url"]))
+            or "custom"
+        )
+        existing_provider = str(existing_model.get("provider", "") or "").strip()
+        # 优先使用 record 的 provider，仅在 record 无法推断时才保留旧值
+        if not record.get("provider") and not detect_provider(str(record["base_url"])):
+            provider = existing_provider or "custom"
+        else:
+            provider = record_provider
+
         model = {
             "default": record["model"],
-            "provider": "custom",
+            "provider": provider,
             "base_url": str(record["base_url"]).strip().lower().rstrip("/"),
             "api_key": record["api_key"],
         }
@@ -72,17 +88,10 @@ def write_runtime_config(record):
         if limits:
             model["model_config"] = limits
         config["model"] = model
-
         tmp = runtime_config.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
         try:
             with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
-                yaml.safe_dump(
-                    config,
-                    handle,
-                    allow_unicode=True,
-                    sort_keys=False,
-                    default_flow_style=False,
-                )
+                yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False, default_flow_style=False)
                 handle.flush()
                 os.fsync(handle.fileno())
             os.replace(tmp, runtime_config)
@@ -92,8 +101,9 @@ def write_runtime_config(record):
     return runtime_config
 
 
-def main():
-    try:
+def try_switch(records, attempt, deferred_records, rotation_lock):
+    """Read, select, health-check, and write while holding the shared rotation lock."""
+    with locked_path(rotation_lock):
         runtime_config = get_runtime_config_path()
         with locked_path(runtime_config):
             with open(runtime_config, encoding="utf-8") as handle:
@@ -105,75 +115,62 @@ def main():
             current.get("default", ""),
         )
 
-        deferred_records = []
+        if attempt > 0 and deferred_records:
+            records = records + deferred_records
+        for record in records:
+            record["base_url"] = str(record.get("base_url", "")).strip().lower().rstrip("/")
+            if any(not record.get(field) for field in ("model", "base_url", "api_key")):
+                continue
+            model_name = str(record.get("model", "")).lower()
+            if any(v in model_name for v in ("glm-4v", "glm-4.6v", "vision", "-v-flash", "vl-")):
+                print(f"Skipping vision model: {record.get('model')}")
+                continue
+            if "openai.com" in record.get("base_url", "") and attempt == 0:
+                print(f"Deferring GPT credential (low priority): {record.get('model')}")
+                deferred_records.append(record)
+                continue
+            if (record["api_key"], record["base_url"], record["model"]) == current_identity:
+                continue
+            ok, _status, error, _used_url = tk(
+                record.get("provider", ""), record["api_key"], record["base_url"], record["model"]
+            )
+            if not ok:
+                label = record.get("label") or record["model"]
+                print(f"Credential unavailable [{label}]: {error or 'health check failed'}")
+                continue
+            path = write_runtime_config(record)
+            return record, path
+    return None, None
+
+
+def main():
+    rotation_lock = Path(__file__).with_name(".rotation")
+    deferred_records = []
+    try:
         for attempt in range(2):
             records = run_sync()
-            # 第二轮尝试时包含之前降级的 GPT 记录
-            if attempt > 0 and deferred_records:
-                records = records + deferred_records
-            for record in records:
-                record["base_url"] = str(record.get("base_url", "")).strip().lower().rstrip("/")
-                required = ("model", "base_url", "api_key")
-                if any(not record.get(field) for field in required):
-                    continue
-                # 过滤视觉模型（max_tokens 限制 1024，不适合文本对话）
-                model_name = str(record.get("model", "")).lower()
-                if any(v in model_name for v in ("glm-4v", "glm-4.6v", "vision", "-v-flash", "vl-")):
-                    print(f"Skipping vision model: {record.get('model')}")
-                    continue
-                # GPT 降优先级: 已知 quota 经常耗尽，只在其他都不可用时才用
-                if "openai.com" in record.get("base_url", "") and attempt == 0:
-                    print(f"Deferring GPT credential (low priority): {record.get('model')}")
-                    deferred_records.append(record)
-                    continue
-                record_identity = (record["api_key"], record["base_url"], record["model"])
-                if record_identity == current_identity:
-                    continue
-                ok, _status, error, _used_url = tk(
-                    record.get("provider", ""),
-                    record["api_key"],
-                    record["base_url"],
-                    record["model"],
-                )
-                if not ok:
-                    label = record.get("label") or record["model"]
-                    print(f"Credential unavailable [{label}]: {error or 'health check failed'}")
-                    continue
-                path = write_runtime_config(record)
+            record, path = try_switch(records, attempt, deferred_records, rotation_lock)
+            if record is not None:
                 label = record.get("label") or record["model"]
                 print(f"Switched to [{label}]; updated {path}")
-
-                # 回写飞书状态
                 record_id = record.get("record_id")
                 if record_id:
                     try:
                         token = gt()
                         agent_name = get_agent_name()
-                        # 新凭证标记为使用中
                         for r in gr(token):
                             if r["record_id"] == record_id:
-                                new_status = status_add(
-                                    r.get("fields", {}).get("状态", ""),
-                                    agent_name,
-                                )
+                                new_status = status_add(r.get("fields", {}).get("状态", ""), agent_name)
                                 us(token, record_id, new_status, note="验证通过")
                                 break
                     except Exception as exc:
-                        print(f"WARNING: 回写飞书状态失败: {exc}", file=sys.stderr)
-
+                        print(f"WARNING: failed to update Feishu status: {exc}", file=sys.stderr)
                 return 0
             if attempt == 0:
                 print("No available credential; syncing and retrying once")
-    except (
-        OSError,
-        subprocess.SubprocessError,
-        ValueError,
-        RuntimeError,
-        json.JSONDecodeError,
-    ) as exc:
+    except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
-
     print("No available credentials", file=sys.stderr)
     return 1
 
