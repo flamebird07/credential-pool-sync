@@ -289,7 +289,7 @@ def tk(p, ak, bu, m):
     last_error = None
     for endpoint in candidates:
         anthropic = endpoint.endswith("/messages")
-        model = m or ("claude-sonnet-4-20250514" if anthropic else "deepseek-v4-flash")
+        model = str(m or ("claude-sonnet-4-20250514" if anthropic else "deepseek-v4-flash")).strip().lower()
         if anthropic:
             headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
             if "longcat" in endpoint.lower():
@@ -377,7 +377,7 @@ def _parse_fallback_list(output):
         base = m.group("base_url")
         entries.append({
             "index": int(m.group(1)) - 1,
-            "model": m.group("model").strip(),
+            "model": m.group("model").strip().lower(),
             "provider": m.group("provider").strip(),
             "base_url": base.strip().lower().rstrip("/") if base else None,
         })
@@ -448,6 +448,19 @@ _INVALID_MODELS = frozenset({
 })
 
 
+def _backfill_token_fields(entries):
+    if not isinstance(entries, list):
+        return entries
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        token = str(entry.get("access_token") or entry.get("api_key") or "").strip()
+        if token:
+            entry["access_token"] = token
+            entry["api_key"] = token
+    return entries
+
+
 def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
     """同步 fallback_providers：将飞书表格中所有非视觉文本模型加入 fallback 链。
 
@@ -460,7 +473,10 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
     healed_urls = healed_urls or {}
     entries = []
     seen = set()
+    used_base_urls = set()
+    duplicate_endpoint_entries = []
     gpt_entries = []
+    duplicate_gpt_entries = []
     
     # 读取当前主模型，避免重复添加
     current_main_model = None
@@ -472,7 +488,7 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
             current_main_model = (
                 str(current_model.get("api_key", "") or "").strip(),
                 str(current_model.get("base_url", "") or "").strip().lower().rstrip("/"),
-                str(current_model.get("default", "") or "").strip(),
+                str(current_model.get("default", "") or "").strip().lower(),
             )
     except Exception:
         pass
@@ -522,18 +538,29 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
 
         entry = {
             "provider": HERMES_CUSTOM_PROVIDER,
-            "model": model,
+            "model": model.strip().lower(),
             "base_url": base_url,
+            "access_token": api_key,
             "api_key": api_key,
         }
 
         # GPT 放最后（quota 经常耗尽）
         if "openai.com" in base_url:
-            gpt_entries.append(entry)
+            if base_url in used_base_urls:
+                duplicate_gpt_entries.append(entry)
+            else:
+                used_base_urls.add(base_url)
+                gpt_entries.append(entry)
         else:
-            entries.append(entry)
+            if base_url in used_base_urls:
+                duplicate_endpoint_entries.append(entry)
+            else:
+                used_base_urls.add(base_url)
+                entries.append(entry)
 
+    entries.extend(duplicate_endpoint_entries)
     entries.extend(gpt_entries)
+    entries.extend(duplicate_gpt_entries)
 
     # 重新读取 config.yaml（避免覆盖其他进程的修改）并写入 fallback_providers
     runtime_config = get_runtime_config_path()
@@ -542,7 +569,9 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
             config = yaml.safe_load(handle) or {}
 
         old_count = len(config.get("fallback_providers") or [])
-        config["fallback_providers"] = entries
+        if "fallback_providers" not in config or not config.get("_sync_managed"):
+            config["fallback_providers"] = entries
+        config["_sync_managed"] = True
 
         tmp = runtime_config.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
         try:
@@ -632,30 +661,37 @@ def _priority(value):
 
 def normalise_base_url(value):
     """Return the canonical Hermes base URL for a credential record."""
-    base_url = str(value or "").strip().lower().rstrip("/")
-    if base_url == "https://ark.cn-beijing.volces.com/api/plan":
-        return "https://ark.cn-beijing.volces.com/api/plan/v1"
-    return base_url
+    base = str(value or "").strip().lower().rstrip("/")
+    if base.endswith(("/v1", "/v3")):
+        return base
+    if base.endswith("/api/plan"):
+        return f"{base}/v1"
+    if base.endswith("/api/coding"):
+        return f"{base}/v3"
+    if base.endswith("/api"):
+        return f"{base}/v3"
+    return base
 
 
 def _normalise_record(record):
     fields = record.get("fields") or {}
-    provider = str(fields.get("Provider", "") or "").strip()
+    provider = str(fields.get("Provider", "") or "").strip().lower()
     label = str(fields.get("Label", "") or "").strip()
     api_key = str(fields.get("API Key", "") or "").strip()
     base_url = normalise_base_url(fields.get("Base URL", ""))
-    model = str(fields.get("模型", "") or "").strip()
+    model = str(fields.get("模型", "") or "").strip().lower()
     priority = _priority(fields.get("优先级", ""))
     # 反推 Provider：如果 Feishu 的 Provider 字段为空或为 "custom"，但从 URL 能推断出标准 Provider，则覆盖
-    inferred = detect_provider(base_url)
-    if inferred and (not provider or provider.lower() == "custom"):
-        provider = inferred
+    if not provider or provider == "custom":
+        provider = (detect_provider(base_url) or "custom").lower()
+    runtime_provider = HERMES_CUSTOM_PROVIDER
     if not api_key or api_key == "***":
         return None
     return {
         "record_id": record.get("record_id", ""),
         "label": label,
         "provider": provider,
+        "runtime_provider": runtime_provider,
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
@@ -696,7 +732,7 @@ def _sync_unlocked(skip_health_rotate=False):
     current_identity = (
         str(current_model.get("api_key", "") or "").strip(),
         str(current_model.get("base_url", "") or "").strip().lower().rstrip("/"),
-        str(current_model.get("default", "") or "").strip(),
+        str(current_model.get("default", "") or "").strip().lower(),
     )
     for r in rs:
         f = r.get("fields") or {}; rid = r.get("record_id", "")
@@ -708,7 +744,7 @@ def _sync_unlocked(skip_health_rotate=False):
                 pending_updates.append((rid, S_I, None))
             continue
         p = normalised["provider"]; l = normalised["label"]; ak = normalised["api_key"]
-        bu = normalised["base_url"]; m = normalised["model"]; pr = normalised["priority"]
+        bu = normalised["base_url"]; m = str(normalised["model"] or "").strip().lower(); pr = normalised["priority"]
         detected_provider = detect_provider(bu)
         original_provider = str(f.get("Provider", "") or "").strip()
         # 注意: 不要修改 api/plan → api/plan/v3
@@ -738,8 +774,27 @@ def _sync_unlocked(skip_health_rotate=False):
             exhaustion_hint = str(e or "").lower()
             if "额度已用完" in exhaustion_hint or "quota exhausted" in exhaustion_hint:
                 if not skip_health_rotate:
-                    print(f"  跳过已耗尽凭证，不加入凭证池")
-                continue
+                    # Reset exhausted credential and retry once.
+                    print(f"  retrying exhausted credential: {p}/{ak[:8]}...")
+                    try:
+                        iv_retry, s_retry, e_retry, url_retry = tk(p, ak, bu, m)
+                        if iv_retry:
+                            health_results[(ak, bu, m)] = (True, S_A, None, url_retry)
+                            iv, s, e, _used_url = True, S_A, None, url_retry
+                            print("  recovered after retry!")
+                            # Fall through to add credential to pool below
+                        else:
+                            health_results[(ak, bu, m)] = (iv_retry, s_retry, e_retry or str(e), url_retry or bu)
+                            print(f"  跳过已耗尽凭证，不加入凭证池")
+                            continue
+                    except Exception as _retry_e:
+                        health_results[(ak, bu, m)] = (False, S_R, str(_retry_e), bu)
+                        print(f"  跳过已耗尽凭证，不加入凭证池")
+                        continue
+                else:
+                    if not skip_health_rotate:
+                        print(f"  跳过已耗尽凭证，不加入凭证池")
+                    continue
         if iv or s == S_R:
             if not skip_health_rotate:
                 print(f"✅ {s}")
@@ -774,10 +829,48 @@ def _sync_unlocked(skip_health_rotate=False):
         if not skip_health_rotate:
             time.sleep(0.3)
     print(f"\n{'='*50}\n✅ {vc} 有效 | ⛔ {r_limit} 限流 | ❌ {ic} 无效")
+    # Keep the configured main model on a healthy credential when possible.
+    if health_results is not None:
+        current_api_key = str(current_model.get("api_key") or current_model.get("access_token") or "").strip()
+        current_base_url = normalise_base_url(current_model.get("base_url", ""))
+        current_default = str(current_model.get("default", "") or "").strip().lower()
+        current_health = health_results.get((current_api_key, current_base_url, current_default))
+        if not current_health or not current_health[0]:
+            healthy_candidates = [
+                record for record in output_records
+                if health_results.get((record["api_key"], record["base_url"], record["model"]), (False,))[0]
+            ]
+            if healthy_candidates:
+                healthy_candidates.sort(key=lambda record: record.get("priority", 99))
+                selected = healthy_candidates[0]
+                runtime_config = get_runtime_config_path()
+                with locked_path(runtime_config):
+                    with open(runtime_config, encoding="utf-8") as handle:
+                        runtime_config_data = yaml.safe_load(handle) or {}
+                    runtime_model = runtime_config_data.setdefault("model", {})
+                    if isinstance(runtime_model, dict):
+                        runtime_model["api_key"] = selected["api_key"]
+                        runtime_model["base_url"] = selected["base_url"]
+                        runtime_model["default"] = selected["model"]
+                        tmp_config = runtime_config.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
+                        try:
+                            with open(tmp_config, "w", encoding="utf-8", newline="\n") as handle:
+                                yaml.safe_dump(runtime_config_data, handle, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                                handle.flush()
+                                os.fsync(handle.fileno())
+                            os.replace(tmp_config, runtime_config)
+                        finally:
+                            if tmp_config.exists():
+                                tmp_config.unlink()
+                print(f"  selected healthy main model: {selected['model']} [{selected['base_url']}]")
+
     AUTH_JSON.parent.mkdir(parents=True, exist_ok=True)
     with locked_path(AUTH_JSON):
         ex = _read_existing_auth()
         existing_pool = ex.get("credential_pool") or {}
+        if isinstance(existing_pool, dict):
+            for entries in existing_pool.values():
+                _backfill_token_fields(entries)
         old_pool_count = (
             sum(len(entries) for entries in existing_pool.values() if isinstance(entries, list))
             if isinstance(existing_pool, dict)
@@ -787,7 +880,7 @@ def _sync_unlocked(skip_health_rotate=False):
         candidate_pool = {}
         for pv, es in fe.items():
             es.sort(key=lambda x: x.get("priority", 99))
-            candidate_pool[pv] = es
+            candidate_pool[pv] = _backfill_token_fields(es)
         new_pool_count = sum(len(entries) for entries in candidate_pool.values())
 
         checked_count = len(health_results) if health_results is not None else 0
