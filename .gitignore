@@ -23,6 +23,10 @@ credentials.json
 # Logs
 *.log
 
+# Lock files
+*.lock
+scripts/.rotation.lock
+
 # Script config (template kept, actual config not committed)
 # sync_credential_pool.py has hardcoded creds - use env vars instead
 

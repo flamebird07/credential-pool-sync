@@ -100,6 +100,7 @@ def write_runtime_config(record):
 
 def try_switch(records, attempt, deferred_records, rotation_lock):
     """Read, select, health-check, and write while holding the shared rotation lock."""
+    current_identity = None
     with locked_path(rotation_lock):
         runtime_config = get_runtime_config_path()
         with locked_path(runtime_config):
@@ -147,8 +148,8 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
                     pass
                 continue
             path = write_runtime_config(record)
-            return record, path
-    return None, None
+            return record, path, current_identity
+    return None, None, current_identity
 
 
 def main():
@@ -157,7 +158,7 @@ def main():
     try:
         for attempt in range(2):
             records = run_sync()
-            record, path = try_switch(records, attempt, deferred_records, rotation_lock)
+            record, path, old_identity = try_switch(records, attempt, deferred_records, rotation_lock)
             if record is not None:
                 label = record.get("label") or record["model"]
                 print(f"Switched to [{label}]; updated {path}")
@@ -166,13 +167,38 @@ def main():
                     try:
                         token = gt()
                         agent_name = get_agent_name()
-                        for r in gr(token):
+                        # 从 records 中找到旧凭证的 record_id
+                        old_record_id = None
+                        if old_identity:
+                            for candidate in records:
+                                candidate_identity = (
+                                    candidate.get("api_key", ""),
+                                    str(candidate.get("base_url", "")).strip().lower().rstrip("/"),
+                                    candidate.get("model", ""),
+                                )
+                                if candidate_identity == old_identity:
+                                    old_record_id = candidate.get("record_id")
+                                    break
+
+                        feishu_records = gr(token)
+
+                        # 先清理旧凭证的 Agent 标记
+                        if old_record_id and old_record_id != record_id:
+                            for r in feishu_records:
+                                if r["record_id"] == old_record_id:
+                                    old_status = r.get("fields", {}).get("状态", "")
+                                    cleaned_status = status_remove(old_status, agent_name)
+                                    us(token, old_record_id, cleaned_status)
+                                    break
+
+                        # 再更新新凭证的 Agent 标记
+                        for r in feishu_records:
                             if r["record_id"] == record_id:
                                 new_status = status_add(r.get("fields", {}).get("状态", ""), agent_name)
                                 us(token, record_id, new_status, note="验证通过")
                                 break
                     except Exception as exc:
-                        print(f"WARNING: failed to update Feishu status: {exc}", file=sys.stderr)
+                        print(f"WARNING: failed to update Feishu credential statuses: {exc}", file=sys.stderr)
                 return 0
             if attempt == 0:
                 print("No available credential; syncing and retrying once")

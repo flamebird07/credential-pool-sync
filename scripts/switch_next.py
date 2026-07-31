@@ -327,12 +327,12 @@ def rotate_once(records, rotation_lock):
 
 def main():
     parser = argparse.ArgumentParser(description="切换到下一个可用凭证")
-    parser.add_argument("--skip-sync", action="store_true", help="直接读取 auth.json，不同步飞书")
+    parser.add_argument("--skip-sync", action="store_true", help="跳过 sync_credential_pool.py 子进程，直接从飞书读取凭证（不更新 auth.json）")
     args = parser.parse_args()
 
     try:
         rotation_lock = Path(__file__).with_name(".rotation")
-        records = read_auth_records() if args.skip_sync else run_sync(full=False)
+        records = read_auth_records() if args.skip_sync else run_sync(full=True)
         target, path = rotate_once(records, rotation_lock)
         if target is None:
             print("没有可用候选，执行完整同步后再试一次...")

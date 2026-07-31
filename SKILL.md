@@ -35,8 +35,8 @@ The method requires strict separation: reviewers cannot be implementers, and eac
 |---|---|---|---|
 | Synchronize or refresh all credentials | `python scripts/sync_credential_pool.py` | Full | Reads Feishu, health-checks every key, atomically writes `auth.json`, then reconciles Feishu |
 | Refresh local pool quickly | `python scripts/sync_credential_pool.py --skip-health-rotate` | Lightweight | Reads Feishu and writes `auth.json`; skips health checks, Feishu writes, and fallback cleanup |
-| Switch to the next credential | `python scripts/switch_next.py` | Lightweight sync + health-check | Rotates to the next healthy credential using `(model, api_key)` identity; no post-switch full sync (v7.6.0 removed the redundant second sync) |
-| Switch using the existing local pool | `python scripts/switch_next.py --skip-sync` | No initial sync; full sync only on zero candidates | Preserves backward-compatible local-first behavior; full sync retry on first pass failure |
+| Switch to the next credential | `python scripts/switch_next.py` | Full sync + health-check | Reads Feishu, writes `auth.json` via sync_credential_pool.py, then health-checks and rotates to next healthy credential; post-switch updates Feishu status for both old and new credential |
+| Switch using the existing local pool | `python scripts/switch_next.py --skip-sync` | No sync subprocess; reads Feishu directly | Reads Feishu records directly without updating `auth.json`; full sync retry on first pass failure |
 | Gateway startup | `python scripts/auto_bootstrap.py` | Lightweight discovery plus per-candidate checks | Selects the first healthy non-current credential |
 | Repair Feishu status | `python scripts/cleanup_feishu_status.py` | Full health scan | Matches active `(api_key, base_url, model)` from `config.yaml`; only that credential is marked in-use |
 | Repair Feishu Provider field | `python scripts/cleanup_feishu_status.py --repair-provider` | Read-only (no health check) | Infers standard Provider (ARK, OPENAI, etc.) from Base URL; updates Feishu when current is empty or "custom" |
@@ -51,9 +51,9 @@ A lightweight sync (`--skip-health-rotate`) reads Feishu and rebuilds `auth.json
 
 `switch_next.py` identifies the current credential by the `(model, api_key, base_url)` triple-key (model + API key + base URL, all normalized). This is the user's preferred uniqueness rule — see "Pitfall: config.yaml 'default' key vs 'model' key identity mismatch" below for why this matters. Candidates are ordered by Feishu return order (not priority), and each candidate is health-checked before switching. `config.yaml` is written atomically with a UUID temporary file, flush, `fsync`, `os.replace`, and a Windows `msvcrt.locking` lock.
 
-If the first pass finds no healthy candidate, the script runs one full sync and retries selection exactly once. This applies even with `--skip-sync`; that flag skips only the initial sync.
+If the first pass finds no healthy candidate, the script runs one full sync and retries selection exactly once. This applies even with `--skip-sync`; that flag skips only the initial sync subprocess.
 
-**Note** (v7.6.0): The post-switch full sync was removed (the `main()` function has `pass` instead of `run_sync(full=True)`). The switch itself is complete after `update_runtime_main_model()` and the Feishu status write-back. A full sync is only triggered as a retry when no healthy candidate is found on the first pass.
+**Note** (v7.11.0): The default `switch_next.py` behavior now runs a full sync (`run_sync(full=True)`) before each switch, ensuring `auth.json` is always up-to-date. The post-switch Feishu status update cleanup was also added for `auto_bootstrap.py` — it now removes the old credential's Agent marker after switching.
 
 ## Pitfall: URL healing causes identity mismatch in fallback chain
 
@@ -259,20 +259,24 @@ The 备注 field is reserved for human-readable notes (e.g. "额度已用完", "
 | `sync_credential_pool.py` | `_sync_unlocked()` | Per-record `status_add`/`status_remove`/`health_status` | `clear_current()` was removed in v7.3.3 — status is now maintained per-record |
 | `cleanup_feishu_status.py` | `cleanup_feishu_status()` | `status_add`/`status_remove`/`health_status` | Uses `probe_status` (not `health_status`) to avoid fn name collision |
 | `switch_next.py` | Post-switch update | `status_remove` on old, `status_add` on new | `usage_add`/`usage_remove` functions removed in v7.3.3 |
-| `auto_bootstrap.py` | `try_switch()` → success | `status_add` on new credential | Already correct; no change needed |
+| `auto_bootstrap.py` | `try_switch()` → success | `status_remove` on old, `status_add` on new | Fixed v7.11.0: now also cleans up old credential's Agent marker via `status_remove` |
 
 ## References
 
 - `references/v7-audit-findings.md` — 2026-07-28 v7.0.0 全面审查发现的问题清单、修复详情和触发矩阵
 - `references/v7.1-audit-findings.md` — 2026-07-29 v7.1.0 审查：subprocess编码修复、cron_sync.sh路径修正、auto_bootstrap飞书回写补全
-- `references/v7.3-crash-analysis.md` — 2026-07-29 429 级联崩溃分析：从 Trae 报告的 5 个 Bug 的根因、时间线和修复措施
+## References
+
 - `references/v7-audit-findings.md` — 2026-07-28 v7.0.0 全面审查发现的问题清单、修复详情和触发矩阵
 - `references/v7.1-audit-findings.md` — 2026-07-29 v7.1.0 审查：subprocess编码修复、cron_sync.sh路径修正、auto_bootstrap飞书回写补全
+- `references/v7.3-crash-analysis.md` — 2026-07-29 429 级联崩溃分析：从 Trae 报告的 5 个 Bug 的根因、时间线和修复措施
 - `references/v7.3.2-provider-writeback-fix.md` — 2026-07-30 v7.3.2 Provider 字段回写不一致修复：4 个脚本中 "custom" 处理条件不一致的 6 处修复
 - `references/v7.3.3-status-field-agent-display.md` — 2026-07-30 v7.3.3 状态栏 Agent 标记显示修复：Agent 使用信息从备注栏迁移到状态栏，删除 clear_current()，修复 health_status 变量名冲突
 - `references/v7.4.0-integrity-protection.md` — 2026-07-30 v7.4.0 凭证池完整性保护、URL 标准化统一、注释修正；四步法审计记录
 - `references/v7.6.0-identity-mismatch.md` — 2026-07-30 v7.6.0 identity 双重确认修复：switch_next.py identity 从 (api_key, base_url, model) 改为 (model, api_key)，解决切换不生效的问题
 - `references/v7.8.0-stale-note-fix.md` — 2026-07-30 v7.8.0 备注栏残留旧值修复：健康检查通过后备注仍显示"额度已用完"的跨脚本一致性问题，统一备注策略
+- `references/v7.9.0-detect-provider-leak.md` — 2026-07-30 v7.9.0 detect_provider 泄漏修复：三条路径（凭证池键、fallback、config）泄漏到非 Hermes Provider 名导致崩溃
+- `references/v7.9.1-endpoint-base-url-fix.md` — 2026-07-30 v7.9.1 endpoint_base_url() 修复：保留 /v3 版本前缀，解决 Feishu 状态不显示 Agent 使用标记的问题
 
 ## Files
 
@@ -299,6 +303,24 @@ credential-pool-sync/
 Hermes `start_gateway.py` launches `auto_bootstrap.py` from this installed skill directory, not from `%USERPROFILE%\credential-pool-sync`.
 
 ## Version history
+
+### v7.11.0 (2026-07-31)
+
+- **Fixed switch_next.py default sync**: Default `run_sync(full=False)` → `run_sync(full=True)`, ensuring `auth.json` is always updated before each switch. Previously, normal switches only read Feishu to memory without writing local `auth.json`.
+- **Fixed switch_next.py --skip-sync help text**: Corrected misleading "直接读取 auth.json" to accurately describe the actual behavior (reads Feishu directly, no auth.json update).
+- **Fixed auto_bootstrap.py old credential status cleanup**: Added `status_remove()` on the old credential after switching. Previously, `auto_bootstrap.py` only updated the new credential's status, leaving the old credential's Agent marker stale.
+- **Updated `try_switch()` return value**: Now returns `(record, path, current_identity)` triple instead of `(record, path)` dual, enabling the caller to identify and clean up the previous credential.
+
+### v7.10.0 (2026-07-30)
+
+- **Fix BUG-01: exhausted status never recovers**: Add retry mechanism for exhausted credentials — before skipping, retry once and if successful, update health status and add to pool
+- **Fix BUG-03: URL suffix missing**: Expand URL normalization to `/api/coding`→`/api/coding/v3` and `/api`→`/api/v3`
+- **Fix BUG-04/05: case inconsistencies**: Provider normalization to lowercase, force to "custom" for Hermes config; all model names lowercased
+- **Fix BUG-08/14: missing access_token**: Add `_backfill_token_fields()` helper to ensure every credential has both token fields
+- **Fix BUG-12: model/endpoint mismatch**: Healthy main model selection — automatically switch to healthy model when current is unhealthy
+- **Fix BUG-17: fallback skips same base_url**: Dedup fallback by base_url, prefer distinct endpoints to avoid Hermes official bug
+- **Fix BUG-02: overwrites config**: `_sync_managed` flag — only update fallback_providers if not marked as managed
+- **Critical loop fixes**: Fixed tk() tuple unpacking bug, ensure recovered credentials are added to pool
 
 ### v7.9.1 (2026-07-30)
 
