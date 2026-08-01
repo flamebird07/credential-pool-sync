@@ -1,7 +1,14 @@
 #!/usr/bin/env python3
 """Reconcile Feishu credential status with the active Hermes model v7.11.0 — 飞书状态管理优化 + Provider 反推修复"""
 
+import os
 import sys
+
+_hermes_site_packages = os.path.join(
+    os.environ.get("APPDATA", ""), "uv", "tools", "hermes-agent", "Lib", "site-packages"
+)
+if os.path.isdir(_hermes_site_packages) and _hermes_site_packages not in sys.path:
+    sys.path.insert(0, _hermes_site_packages)
 
 import yaml
 from sync_credential_pool import (

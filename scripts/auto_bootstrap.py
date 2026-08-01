@@ -8,6 +8,12 @@ import sys
 import uuid
 from pathlib import Path
 
+_hermes_site_packages = os.path.join(
+    os.environ.get("APPDATA", ""), "uv", "tools", "hermes-agent", "Lib", "site-packages"
+)
+if os.path.isdir(_hermes_site_packages) and _hermes_site_packages not in sys.path:
+    sys.path.insert(0, _hermes_site_packages)
+
 import yaml
 
 from sync_credential_pool import (

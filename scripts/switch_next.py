@@ -2,6 +2,13 @@
 """切换到下一个可用凭证 v7.11.0 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
+
+_hermes_site_packages = os.path.join(
+    os.environ.get("APPDATA", ""), "uv", "tools", "hermes-agent", "Lib", "site-packages"
+)
+if os.path.isdir(_hermes_site_packages) and _hermes_site_packages not in sys.path:
+    sys.path.insert(0, _hermes_site_packages)
+
 import yaml
 from pathlib import Path
 from contextlib import contextmanager
@@ -151,18 +158,26 @@ def read_auth_records():
         return []
 
 def run_sync(full=False):
-    """运行同步，返回记录列表"""
+    """Run a mandatory full sync before selecting the next credential.
+
+    A rotation must fail closed when the local cache cannot be refreshed from
+    Feishu; continuing would permit a stale credential to be selected.
+    """
     if full:
         import subprocess
         try:
             sync_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_credential_pool.py")
-            result = subprocess.run([sys.executable, sync_script], capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace")
+            result = subprocess.run([sys.executable, sync_script], capture_output=True, text=True, timeout=240, encoding="utf-8", errors="replace")
             if result.returncode != 0:
-                print(f"ERROR: 同步失败: {result.stderr}")
+                detail = (result.stderr or result.stdout or "unknown error").strip()
+                raise RuntimeError(f"Full Feishu sync failed; switch cancelled: {detail[:500]}")
             else:
-                print("同步完成")
-        except Exception as e:
-            print(f"ERROR: 运行同步失败: {e}")
+                print("Full Feishu sync completed; local credential cache is current")
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                "Full Feishu sync timed out after 240 seconds; switch cancelled "
+                "to avoid using stale local credentials"
+            ) from exc
     return read_auth_records()
 
 def _normalise_record(record):
@@ -349,8 +364,13 @@ def main():
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
-    print(f"切换成功: {target.get('label') or target['model']}")
+    print(f"默认配置已切换: {target.get('label') or target['model']}")
     print(f"主模型配置已更新: {path}")
+    print(
+        "生效范围: 下一条新消息会按此配置创建/重建 Agent。"
+        "当前正在生成的回复仍使用切换前的运行时；若其中出现 fallback 通知，"
+        "该通知描述的是旧运行时，不代表本次配置切换失败。"
+    )
 
     # 回写飞书状态和备注
     if target.get("record_id"):

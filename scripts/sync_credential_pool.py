@@ -3,6 +3,22 @@
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
+
+# The gateway injects this directory through PYTHONPATH, but scheduled and
+# manual invocations do not. Keep the standalone credential-pool entry point
+# runnable in both cases.
+_hermes_site_packages = os.path.join(
+    os.environ.get("APPDATA", ""), "uv", "tools", "hermes-agent", "Lib", "site-packages"
+)
+if os.path.isdir(_hermes_site_packages) and _hermes_site_packages not in sys.path:
+    sys.path.insert(0, _hermes_site_packages)
+
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, OSError):
+        pass
+
 import yaml
 from urllib.parse import urlparse
 from contextlib import contextmanager
@@ -197,17 +213,14 @@ def us(t, rid, s=None, note=None, provider=None, base_url=None):
     request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
 
 def endpoint_candidates(base_url):
-    base = str(base_url or "").strip().rstrip("/")
-    suffixes = (
-        "/v3/chat/completions", "/v1/chat/completions", "/chat/completions",
-        "/v3/messages", "/v1/messages", "/messages",
-    )
-    base = _strip_endpoint_suffix(base)
-    for version in ("/v3", "/v1"):
-        if base.lower().endswith(version):
-            base = base[:-len(version)].rstrip("/")
-            break
-    return [f"{base}{suffix}" for suffix in suffixes]
+    """Return protocol paths for exactly one configured credential route.
+
+    A credential's Plan route is part of its identity.  Do not strip a
+    ``/v1`` or ``/v3`` suffix and then probe another Plan/version: doing so
+    can use Coding-Plan's response to classify Agent-Plan (or vice versa).
+    """
+    base = _strip_endpoint_suffix(base_url)
+    return [f"{base}/chat/completions", f"{base}/messages"]
 
 
 def _strip_endpoint_suffix(value):
@@ -249,29 +262,16 @@ def detect_provider(base_url):
 
 
 def try_url_variants(base_url):
-    """Return base URL variants used for endpoint discovery and self-healing."""
+    """Keep health checks on the exact route stored in Feishu.
+
+    Endpoint healing is intentionally not performed during health checks:
+    changing ``api/plan`` into ``api/coding`` makes status attribution
+    unreliable.  Route corrections must be made explicitly in Feishu.
+    """
     base = _strip_endpoint_suffix(base_url)
     if not base:
         return []
-    # Records may contain a base URL or a complete endpoint. Probe both common
-    # API generations and both schemes for provider-neutral self-healing.
-    parsed = urlparse(base if "://" in base else f"https://{base}")
-    root = parsed._replace(path=parsed.path.rstrip("/"))
-    path = root.path
-    if path.lower().endswith(("/v1", "/v3")):
-        root = root._replace(path=path[:-3].rstrip("/"))
-    path_variants = [root._replace(path=f"{root.path.rstrip('/')}{version}").geturl().rstrip("/") for version in ("", "/v3", "/v1")]
-    schemes = ("https", "http")
-    variants = [urlparse(candidate)._replace(scheme=scheme).geturl().rstrip("/")
-                for candidate in path_variants for scheme in schemes]
-
-    if "ark.cn-beijing.volces.com" in (parsed.hostname or "").lower():
-        variants.extend(
-            f"{scheme}://{parsed.netloc}{suffix}"
-            for scheme in schemes
-            for suffix in ("/api/plan/v3", "/api/coding/v3", "/api/plan/v1", "/api/v3")
-        )
-    return list(dict.fromkeys(variants))
+    return [base]
 
 
 def model_limits(model_name):
@@ -285,9 +285,6 @@ def model_limits(model_name):
 def tk(p, ak, bu, m):
     if not ak or not bu:
         return False, S_I, "缺少必填", ""
-    # 已知账号级限流 key 前缀（火山 ARK 账号 2103691131）
-    if ak.startswith("44e38313") and "ark.cn-beijing.volces.com" in str(bu or "").lower():
-        return False, S_R, "HTTP 429: 账号级 rate limited", str(bu or "").rstrip("/")
     candidates = [endpoint for variant in try_url_variants(bu) for endpoint in endpoint_candidates(variant)]
     last_error = None
     last_status = S_U
@@ -343,9 +340,16 @@ def tk(p, ak, bu, m):
                     continue
                 return False, S_I, "Key 无效", endpoint.rstrip("/")
             if exc.code == 404:
-                last_error = "HTTP 404模型不存在"
-                last_status = S_I
-                continue
+                # A 404 on a model route proves neither that the API key is
+                # invalid nor that the credential itself is unusable.  ARK
+                # returns this for a model outside the account's entitlement
+                # and for an unavailable endpoint/model combination.
+                return (
+                    False,
+                    S_U,
+                    "HTTP 404: model or account entitlement unavailable",
+                    endpoint.rstrip("/"),
+                )
             if exc.code == 405:
                 last_error = "HTTP 405"
                 continue
@@ -553,7 +557,10 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
             result = health_results.get(identity)
             if result and not result[0]:
                 status = result[1]
-                if status == S_I or status == S_R:
+                # Do not put a route with a confirmed model/access 404 into
+                # fallback.  It cannot recover through a retry and must not
+                # be mislabeled as an invalid key.
+                if status == S_I or status == S_R or "HTTP 404" in str(result[2] or ""):
                     continue
             
         # 跳过当前主模型（避免重复）
@@ -812,11 +819,9 @@ def _sync_unlocked(skip_health_rotate=False):
             # 健康检查失败时，设置正确的健康状态，从状态栏移除当前 Agent
             new_status = health_status(False, s, e)
             h_note = e or s
-            if s == S_I and "404" in str(e or ""):
-                h_note = "HTTP 404模型不存在"
+            if "404" in str(e or ""):
+                h_note = "HTTP 404: model or account entitlement unavailable"
             print(f"❌ {s}"); ic += 1
-            if s == S_U:
-                h_note = next((value for key, value in f.items() if "敞" in str(key)), h_note)
             pending_updates.append((rid, new_status, h_note))
         if not skip_health_rotate:
             time.sleep(0.3)
@@ -927,12 +932,52 @@ def sync(skip_health_rotate=False):
         return _sync_unlocked(skip_health_rotate)
 
 
+def mark_runtime_failure(failure_kind):
+    """Write a Hermes runtime failure to the one matching Feishu record.
+
+    Runtime identity is supplied by the gateway through environment variables
+    so a fallback route is never confused with the globally configured primary
+    route.  Model + exact Base URL must identify exactly one record; otherwise
+    this function fails closed rather than writing a misleading status.
+    """
+    model = str(os.environ.get("HERMES_FAILURE_MODEL", "") or "").strip().lower()
+    base_url = normalise_base_url(os.environ.get("HERMES_FAILURE_BASE_URL", ""))
+    if not model or not base_url:
+        config = yaml.safe_load(get_runtime_config_path().read_text(encoding="utf-8")) or {}
+        current = config.get("model") or {}
+        model = str(current.get("default", "") or "").strip().lower()
+        base_url = normalise_base_url(current.get("base_url", ""))
+    if not model or not base_url:
+        raise ValueError("runtime failure identity is missing model or base_url")
+
+    token = gt()
+    matches = []
+    for raw in gr(token):
+        record = _normalise_record(raw)
+        if not record:
+            continue
+        if record["model"].strip().lower() == model and normalise_base_url(record["base_url"]) == base_url:
+            matches.append(record)
+    if len(matches) != 1:
+        raise ValueError(f"runtime failure identity matched {len(matches)} Feishu records")
+
+    rate_limited = failure_kind in {"rate_limit", "billing", "upstream_rate_limit"}
+    status = S_R if rate_limited else S_U
+    note = f"Hermes runtime failure: {failure_kind}"
+    us(token, matches[0]["record_id"], status, note=note)
+    print(f"Marked runtime failure for {matches[0]['label'] or matches[0]['model']}: {failure_kind}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="同步飞书凭证池到 Hermes")
     parser.add_argument("--skip-health-rotate", action="store_true", help="跳过健康检查，直接同步")
+    parser.add_argument("--mark-runtime-failure", metavar="KIND", help="mark the exact runtime route as failed")
     args = parser.parse_args()
 
     try:
+        if args.mark_runtime_failure:
+            mark_runtime_failure(args.mark_runtime_failure)
+            return 0
         sync(args.skip_health_rotate)
     except KeyboardInterrupt:
         print("\n\n用户中断，同步已取消")
