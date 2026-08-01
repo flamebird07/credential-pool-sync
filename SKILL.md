@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.9.1 fixes endpoint_base_url() version stripping bug — Feishu status now correctly shows which credential is in use for each agent."
-version: 7.9.1
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.11.1 adds GitHub sync procedure, git corruption recovery, and terminal failure workaround."
+version: 7.11.1
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.9.0
+# Credential Pool Sync v7.11.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -263,20 +263,83 @@ The 备注 field is reserved for human-readable notes (e.g. "额度已用完", "
 
 ## References
 
+- `references/2026-07-31-crash-postmortem.md` — 2026-07-31 凭证池崩溃事后分析（B1-B8 根因、修复状态、崩溃时间线、经验教训）
+- `references/four-step-method-execution.md` — 四步法执行模式文档
+- `references/main-model-switch.md` — 主模型切换流程
 - `references/v7-audit-findings.md` — 2026-07-28 v7.0.0 全面审查发现的问题清单、修复详情和触发矩阵
 - `references/v7.1-audit-findings.md` — 2026-07-29 v7.1.0 审查：subprocess编码修复、cron_sync.sh路径修正、auto_bootstrap飞书回写补全
-## References
+- `references/v7.3-crash-analysis.md` — 2026-07-29 429 级联崩溃分析
+- `references/v7.3.2-provider-writeback-fix.md` — 2026-07-30 v7.3.2 Provider 字段回写不一致修复
+- `references/v7.3.3-status-field-agent-display.md` — 2026-07-30 v7.3.3 状态栏 Agent 标记显示修复
+- `references/v7.4.0-integrity-protection.md` — 2026-07-30 v7.4.0 凭证池完整性保护
+- `references/v7.6.0-identity-mismatch.md` — 2026-07-30 v7.6.0 identity 双重确认修复
+- `references/v7.8.0-stale-note-fix.md` — 2026-07-30 v7.8.0 备注栏残留旧值修复
+- `references/v7.9.0-detect-provider-leak.md` — 2026-07-30 v7.9.0 detect_provider 泄漏修复
+- `references/v7.9.1-endpoint-base-url-fix.md` — 2026-07-30 v7.9.1 endpoint_base_url() 修复
+- `references/v7.10.0-comprehensive-fix.md` — 2026-07-30 v7.10.0 综合修复（BUG-01~17）
 
-- `references/v7-audit-findings.md` — 2026-07-28 v7.0.0 全面审查发现的问题清单、修复详情和触发矩阵
-- `references/v7.1-audit-findings.md` — 2026-07-29 v7.1.0 审查：subprocess编码修复、cron_sync.sh路径修正、auto_bootstrap飞书回写补全
-- `references/v7.3-crash-analysis.md` — 2026-07-29 429 级联崩溃分析：从 Trae 报告的 5 个 Bug 的根因、时间线和修复措施
-- `references/v7.3.2-provider-writeback-fix.md` — 2026-07-30 v7.3.2 Provider 字段回写不一致修复：4 个脚本中 "custom" 处理条件不一致的 6 处修复
-- `references/v7.3.3-status-field-agent-display.md` — 2026-07-30 v7.3.3 状态栏 Agent 标记显示修复：Agent 使用信息从备注栏迁移到状态栏，删除 clear_current()，修复 health_status 变量名冲突
-- `references/v7.4.0-integrity-protection.md` — 2026-07-30 v7.4.0 凭证池完整性保护、URL 标准化统一、注释修正；四步法审计记录
-- `references/v7.6.0-identity-mismatch.md` — 2026-07-30 v7.6.0 identity 双重确认修复：switch_next.py identity 从 (api_key, base_url, model) 改为 (model, api_key)，解决切换不生效的问题
-- `references/v7.8.0-stale-note-fix.md` — 2026-07-30 v7.8.0 备注栏残留旧值修复：健康检查通过后备注仍显示"额度已用完"的跨脚本一致性问题，统一备注策略
-- `references/v7.9.0-detect-provider-leak.md` — 2026-07-30 v7.9.0 detect_provider 泄漏修复：三条路径（凭证池键、fallback、config）泄漏到非 Hermes Provider 名导致崩溃
-- `references/v7.9.1-endpoint-base-url-fix.md` — 2026-07-30 v7.9.1 endpoint_base_url() 修复：保留 /v3 版本前缀，解决 Feishu 状态不显示 Agent 使用标记的问题
+## GitHub Synchronization
+
+The remote repository is at `github.com/flamebird07/credential-pool-sync`. The installed skill is the canonical runtime — sync it to GitHub when version increments.
+
+### Sync procedure
+
+```bash
+# 1. Clone fresh (avoids local repo corruption)
+git clone https://github.com/flamebird07/credential-pool-sync.git /tmp/credential-pool-clone
+cd /tmp/credential-pool-clone
+
+# 2. Compare remote vs installed skill versions
+# Check SKILL.md version and all script sizes
+diff <(git ls-tree -r --name-only HEAD | sort) \
+     <(ls %LOCALAPPDATA%\\hermes\\skills\\devops\\credential-pool-sync/**/*)
+
+# 3. Overwrite with installed skill files
+cp %LOCALAPPDATA%\\hermes\\skills\\devops\\credential-pool-sync\\SKILL.md .
+cp %LOCALAPPDATA%\\hermes\\skills\\devops\\credential-pool-sync\\scripts\\*.py scripts/
+cp %LOCALAPPDATA%\\hermes\\skills\\devops\\credential-pool-sync\\scripts\\*.sh scripts/
+# Copy any new reference files
+for f in %LOCALAPPDATA%\\hermes\\skills\\devops\\credential-pool-sync\\references\\*.md; do
+  cp "$f" references/
+done
+
+# 4. Commit and push
+git add -A
+git commit -m "vX.Y.Z: <description>"
+git push origin master
+git tag vX.Y.Z
+git push origin vX.Y.Z
+```
+
+### Pitfall: Local git repo corruption
+
+**Symptoms**: `git status` reports `fatal: unable to read <hash>`, `.git/config` is missing, or `git remote -v` returns empty despite `remotes/origin/master` existing.
+
+**Root cause**: The `.git/config` file can be deleted independently from the git objects directory. If the index references missing blob objects, all git operations fail.
+
+**Fix**: Never try to repair a corrupted local repo. Clone fresh:
+```bash
+rm -rf credential-pool-sync
+git clone https://github.com/flamebird07/credential-pool-sync.git
+```
+Then overwrite with the installed skill files as described above.
+
+### Pitfall: Remote tag says v7.11.0 but files are outdated
+
+The remote `v7.11.0` tag may have been set on a commit that only updates the tag name, not the actual script files. Always verify file content (not just the tag) by comparing the installed skill's script sizes and version strings with the remote's `HEAD`.
+
+### Terminal failure recovery for git operations
+
+When the Hermes `terminal` tool is completely unresponsive (all commands time out), use `execute_code` with `subprocess.run` and direct paths to `git.exe`:
+
+```python
+import subprocess
+git = r"C:\Program Files\Git\bin\git.exe"
+result = subprocess.run([git, "status"], capture_output=True, text=True, timeout=10, cwd=repo_path)
+print(result.stdout)
+```
+
+This bypasses the broken shell session entirely. The `execute_code` tool uses a Python sandbox with its own process management, independent of the terminal's shell state.
 
 ## Files
 
@@ -284,25 +347,36 @@ The 备注 field is reserved for human-readable notes (e.g. "额度已用完", "
 credential-pool-sync/
 ├── SKILL.md
 ├── references/
-│   ├── v7.3-crash-analysis.md
+│   ├── 2026-07-31-crash-postmortem.md
+│   ├── four-step-method-execution.md
+│   ├── main-model-switch.md
 │   ├── v7-audit-findings.md
 │   ├── v7.1-audit-findings.md
+│   ├── v7.3-crash-analysis.md
 │   ├── v7.3.2-provider-writeback-fix.md
 │   ├── v7.3.3-status-field-agent-display.md
 │   ├── v7.4.0-integrity-protection.md
-│   └── v7.6.0-identity-mismatch.md
+│   ├── v7.6.0-identity-mismatch.md
+│   ├── v7.8.0-stale-note-fix.md
+│   ├── v7.9.0-detect-provider-leak.md
+│   ├── v7.9.1-endpoint-base-url-fix.md
+│   └── v7.10.0-comprehensive-fix.md
 └── scripts/
-    ├── sync_credential_pool.py
-    ├── switch_next.py
     ├── auto_bootstrap.py
     ├── cleanup_feishu_status.py
     ├── cron_sync.sh
-    └── four-step-template.py
+    ├── four-step-template.py
+    ├── switch_next.py
+    └── sync_credential_pool.py
 ```
 
-Hermes `start_gateway.py` launches `auto_bootstrap.py` from this installed skill directory, not from `%USERPROFILE%\credential-pool-sync`.
-
 ## Version history
+
+### v7.11.1 (2026-08-01)
+
+- **Added GitHub Sync section**: Documented the full sync procedure, git corruption recovery, and terminal failure workaround. The installed skill is the canonical source — the GitHub repo is a mirror, not the authoritative copy.
+- **Updated Files tree**: Added missing `v7.10.0-comprehensive-fix.md` and `2026-07-31-crash-postmortem.md` to the reference files listing.
+- **Added pitfall: Remote tag vs file content mismatch**: The remote `v7.11.0` tag may reference outdated files — always verify actual content before assuming the remote is up to date.
 
 ### v7.11.0 (2026-07-31)
 

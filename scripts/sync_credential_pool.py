@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.3.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
+"""凭证池同步脚本 v7.11.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -285,8 +285,12 @@ def model_limits(model_name):
 def tk(p, ak, bu, m):
     if not ak or not bu:
         return False, S_I, "缺少必填", ""
+    # 已知账号级限流 key 前缀（火山 ARK 账号 2103691131）
+    if ak.startswith("44e38313") and "ark.cn-beijing.volces.com" in str(bu or "").lower():
+        return False, S_R, "HTTP 429: 账号级 rate limited", str(bu or "").rstrip("/")
     candidates = [endpoint for variant in try_url_variants(bu) for endpoint in endpoint_candidates(variant)]
     last_error = None
+    last_status = S_U
     for endpoint in candidates:
         anthropic = endpoint.endswith("/messages")
         model = m or ("claude-sonnet-4-20250514" if anthropic else "deepseek-v4-flash")
@@ -304,7 +308,24 @@ def tk(p, ak, bu, m):
         try:
             with urllib.request.urlopen(request, timeout=8) as response:
                 code = response.getcode()
+                body = response.read()
             if 200 <= code < 300:
+                # 某些 Provider（如 ARK）会在 200 响应体里返回账号级错误码
+                try:
+                    data = json.loads(body)
+                    err_code = None
+                    err_msg = ""
+                    if isinstance(data, dict):
+                        err = data.get("error")
+                        if isinstance(err, dict):
+                            err_code = err.get("code")
+                            err_msg = err.get("message", "")
+                        err_code = err_code or data.get("code")
+                        err_msg = err_msg or data.get("message", "")
+                    if err_code in ("SetLimitExceeded", "RateLimitExceeded", "LimitExceeded", "RateLimit"):
+                        return False, S_R, f"HTTP {code}: 账号级 {err_code}", endpoint.rstrip("/")
+                except Exception:
+                    pass
                 return True, S_A, None, endpoint.rstrip("/")
             if code == 429:
                 return False, S_R, "HTTP 429: rate limited", endpoint.rstrip("/")
@@ -316,9 +337,17 @@ def tk(p, ak, bu, m):
             if exc.code == 429:
                 return False, S_R, "额度已用完", endpoint.rstrip("/")
             if exc.code in (401, 403):
+                # 非 Anthropic/longcat 的 /messages 端点返回 401/403 属于端点不匹配，
+                # 直接跳过并保留更早的错误信息（如 404 模型不存在）
+                if endpoint.endswith("/messages") and "anthropic" not in endpoint.lower() and "longcat" not in endpoint.lower():
+                    continue
                 return False, S_I, "Key 无效", endpoint.rstrip("/")
-            if exc.code in (404, 405):
-                last_error = f"HTTP {exc.code}"
+            if exc.code == 404:
+                last_error = "HTTP 404模型不存在"
+                last_status = S_I
+                continue
+            if exc.code == 405:
+                last_error = "HTTP 405"
                 continue
             if 400 <= exc.code < 500:
                 return False, S_U, f"HTTP {exc.code}", endpoint.rstrip("/")
@@ -328,7 +357,7 @@ def tk(p, ak, bu, m):
             continue
         except Exception as exc:
             return False, S_U, f"异常: {str(exc)[:80]}", endpoint.rstrip("/")
-    return False, S_U, last_error or "无可用端点", candidates[-1].rstrip("/")
+    return False, last_status, last_error or "无可用端点", candidates[-1].rstrip("/")
 
 
 @contextmanager
@@ -384,7 +413,7 @@ def _parse_fallback_list(output):
     return entries
 
 def cleanup_fallback_chain(records, health_results=None):
-    """Remove fallback providers whose base_url no longer exists in Feishu records."""
+    """Remove fallback providers missing from Feishu or failing health checks."""
     print(f"\n{'='*50}\n🧹 清理 fallback chain\n{'='*50}")
     feishu_base_urls = set()
     for r in records:
@@ -411,7 +440,28 @@ def cleanup_fallback_chain(records, health_results=None):
         print("  无 fallback 配置")
         return
 
-    stale = [e for e in entries if e["base_url"] and e["base_url"] not in feishu_base_urls]
+    failed_health = set()
+    if health_results is not None:
+        for identity, result in health_results.items():
+            if not result or result[0]:
+                continue
+            if not isinstance(identity, tuple) or len(identity) < 3:
+                continue
+            _, base_url, model = identity[:3]
+            failed_health.add(
+                (
+                    str(base_url or "").strip().lower().rstrip("/"),
+                    str(model or "").strip(),
+                )
+            )
+
+    stale = [
+        e for e in entries
+        if e["base_url"] and (
+            e["base_url"] not in feishu_base_urls
+            or (e["base_url"], e["model"]) in failed_health
+        )
+    ]
     if not stale:
         print("  fallback chain 与飞书记录一致")
         return
@@ -497,17 +547,13 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
         if name_lower in _INVALID_MODELS:
             continue
         
-        # 跳过健康检查确认无效的模型；限流模型仍保留在 fallback 链中
+        # 跳过健康检查确认无效或限流的模型
         identity = (api_key, base_url, model)
         if health_results is not None:
             result = health_results.get(identity)
             if result and not result[0]:
                 status = result[1]
-                error_text = str(result[2] or "").lower()
-                if status == S_I or (
-                    status == S_R
-                    and ("quota" in error_text or "exhausted" in error_text)
-                ):
+                if status == S_I or status == S_R:
                     continue
             
         # 跳过当前主模型（避免重复）
@@ -646,6 +692,9 @@ def _normalise_record(record):
     base_url = normalise_base_url(fields.get("Base URL", ""))
     model = str(fields.get("模型", "") or "").strip()
     priority = _priority(fields.get("优先级", ""))
+    # glm-5-2 在 ARK 上必须使用 /api/v3 端点
+    if model.lower().startswith("glm-5-2") and base_url == "https://ark.cn-beijing.volces.com/api":
+        base_url = "https://ark.cn-beijing.volces.com/api/v3"
     # 反推 Provider：如果 Feishu 的 Provider 字段为空或为 "custom"，但从 URL 能推断出标准 Provider，则覆盖
     inferred = detect_provider(base_url)
     if inferred and (not provider or provider.lower() == "custom"):
@@ -680,7 +729,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.2.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.11.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     fe, vc, r_limit, ic, output_records, pending_updates = {}, 0, 0, 0, [], []
@@ -735,38 +784,36 @@ def _sync_unlocked(skip_health_rotate=False):
         if health_results is not None:
             health_results[(ak, bu, m)] = (iv, s, e, _used_url)
         if s == S_R:
-            exhaustion_hint = str(e or "").lower()
-            if "额度已用完" in exhaustion_hint or "quota exhausted" in exhaustion_hint:
-                if not skip_health_rotate:
-                    print(f"  跳过已耗尽凭证，不加入凭证池")
-                continue
-        if iv or s == S_R:
+            if not skip_health_rotate:
+                print(f"⛔ {s}")
+                new_status = health_status(False, s, e)
+                h_note = e or "额度已用完"
+                pending_updates.append((rid, new_status, h_note))
+            r_limit += 1
+            continue
+        if iv:
             if not skip_health_rotate:
                 print(f"✅ {s}")
                 # 状态栏显示 Agent 使用信息，备注保留原始说明
-                if iv:
-                    if (ak, bu, m) == current_identity:
-                        new_status = status_add(f.get("状态", ""), agent_name)
-                    else:
-                        new_status = status_remove(f.get("状态", ""), agent_name)
+                if (ak, bu, m) == current_identity:
+                    new_status = status_add(f.get("状态", ""), agent_name)
                 else:
-                    new_status = health_status(iv, s, e)
-                h_note = f.get("备注", "")
+                    new_status = status_remove(f.get("状态", ""), agent_name)
+                h_note = "验证通过"
                 pending_updates.append((rid, new_status, h_note))
-            if iv:
-                vc += 1
-            elif s == S_R:
-                r_limit += 1
+            vc += 1
             output_records.append(normalised)
             rid_full = r.get("record_id", "")
             eid = f"sync-{rid_full}" if rid_full else f"sync-{uuid.uuid4().hex[:12]}"
             pk = _hermes_pool_key(p)
             hermes_provider = HERMES_CUSTOM_PROVIDER
-            fe.setdefault(pk, []).append({"id": eid, "label": l or m, "provider": hermes_provider, "model": m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "access_token": ak, "api_key": ak, "last_status": "active" if iv else "rate_limited", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
+            fe.setdefault(pk, []).append({"id": eid, "label": l or m, "provider": hermes_provider, "model": m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "access_token": ak, "api_key": ak, "last_status": "active", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
         else:
             # 健康检查失败时，设置正确的健康状态，从状态栏移除当前 Agent
             new_status = health_status(False, s, e)
-            h_note = f.get("备注", "")
+            h_note = e or s
+            if s == S_I and "404" in str(e or ""):
+                h_note = "HTTP 404模型不存在"
             print(f"❌ {s}"); ic += 1
             if s == S_U:
                 h_note = next((value for key, value in f.items() if "敞" in str(key)), h_note)
@@ -851,6 +898,25 @@ def _sync_unlocked(skip_health_rotate=False):
         cleanup_fallback_chain(rs, health_results)
     print(f"\n{'='*50}\n✅ 同步完成\n{'='*50}")
     output_records.sort(key=lambda item: item["priority"])
+    current_in_pool = any(
+        (
+            str(record.get('api_key', '')).strip(),
+            normalise_base_url(record.get('base_url', '')),
+            record.get('model', ''),
+        ) == (
+            current_identity[0],
+            normalise_base_url(current_identity[1]),
+            current_identity[2],
+        )
+        for record in output_records
+    )
+
+    if not current_in_pool:
+        print(
+            'WARNING: 当前主模型不在最终有效凭证池中，'
+            '建议运行 scripts/switch_next.py 切换到下一个可用凭证',
+            file=sys.stderr,
+        )
     print("__RECORDS__" + json.dumps(output_records, ensure_ascii=False, separators=(",", ":")))
 
 

@@ -152,6 +152,47 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
     return None, None, current_identity
 
 
+def report_exhaustion(records, old_identity):
+    """All candidates exhausted: mark the current credential failed in Feishu
+    and clear fallback_providers in config.yaml. Failures here never change
+    the exit code."""
+    try:
+        if old_identity:
+            token = gt()
+            for candidate in records:
+                identity = (
+                    candidate.get("api_key", ""),
+                    str(candidate.get("base_url", "")).strip().lower().rstrip("/"),
+                    candidate.get("model", ""),
+                )
+                if identity == old_identity and candidate.get("record_id"):
+                    us(token, candidate["record_id"], health_status(False, S_U),
+                       note="无可用候选，主凭证失效")
+                    break
+    except Exception as exc:
+        print(f"WARNING: failed to report main credential failure: {exc}", file=sys.stderr)
+
+    try:
+        runtime_config = get_runtime_config_path()
+        with locked_path(runtime_config):
+            with open(runtime_config, encoding="utf-8") as handle:
+                config = yaml.safe_load(handle) or {}
+            if isinstance(config, dict) and config.get("fallback_providers"):
+                config["fallback_providers"] = []
+                tmp = runtime_config.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
+                try:
+                    with open(tmp, "w", encoding="utf-8", newline="\n") as handle:
+                        yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False, default_flow_style=False)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.replace(tmp, runtime_config)
+                finally:
+                    if tmp.exists():
+                        tmp.unlink()
+    except Exception as exc:
+        print(f"WARNING: failed to clear fallback_providers: {exc}", file=sys.stderr)
+
+
 def main():
     rotation_lock = Path(__file__).with_name(".rotation")
     deferred_records = []
@@ -206,6 +247,7 @@ def main():
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
     print("No available credentials", file=sys.stderr)
+    report_exhaustion(records, old_identity)
     return 1
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.3.0 — 含飞书状态管理优化 + Provider 反推修复"""
+"""切换到下一个可用凭证 v7.11.0 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 import yaml
@@ -155,7 +155,8 @@ def run_sync(full=False):
     if full:
         import subprocess
         try:
-            result = subprocess.run([sys.executable, "sync_credential_pool.py"], capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace")
+            sync_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_credential_pool.py")
+            result = subprocess.run([sys.executable, sync_script], capture_output=True, text=True, timeout=60, encoding="utf-8", errors="replace")
             if result.returncode != 0:
                 print(f"ERROR: 同步失败: {result.stderr}")
             else:
@@ -172,6 +173,9 @@ def _normalise_record(record):
     base_url = normalise_base_url(fields.get("Base URL", ""))
     model = str(fields.get("模型", "") or "").strip()
     priority = _priority(fields.get("优先级", ""))
+    # glm-5-2 在 ARK 上必须使用 /api/v3 端点
+    if model.lower().startswith("glm-5-2") and base_url == "https://ark.cn-beijing.volces.com/api":
+        base_url = "https://ark.cn-beijing.volces.com/api/v3"
     # 反推 Provider：如果 Provider 为空或为 custom，从 URL 推断
     if not provider or provider.lower() == "custom":
         provider = detect_provider(base_url) or provider
