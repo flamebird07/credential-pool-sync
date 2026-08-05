@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.11.0 — 含飞书状态管理优化 + Provider 反推修复"""
+"""切换到下一个可用凭证 v7.12.0 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 
@@ -19,6 +19,7 @@ from sync_credential_pool import (
     status_remove,
     tk,
     endpoint_candidates,
+    update_runtime_main_model,
 )
 
 BASE_TOKEN = "YedtbFYKZatu2QsGti9ch7xbnGc"
@@ -140,13 +141,6 @@ def identity(record):
     base_url = normalise_base_url(record.get("base_url", ""))
     return (model.lower(), api_key.strip(), base_url)
 
-def model_limits(model_name):
-    """Return model_config for models with known context length issues."""
-    name = str(model_name or "").strip().lower()
-    if name in ("glm-4.6v", "glm-4.5-air"):
-        return {"max_tokens": 4096, "context_length": 32768}
-    return {}
-
 def read_auth_records():
     """从飞书读取凭证记录"""
     try:
@@ -267,46 +261,6 @@ def ordered_candidates(records, current):
     index = next((i for i, record in enumerate(records) if current_identity is not None and identity(record) == current_identity), None)
     ordered = records if index is None else records[index + 1:] + records[:index + 1]
     return [record for record in ordered if current_identity is None or identity(record) != current_identity]
-
-def update_runtime_main_model(record):
-    path = get_runtime_config_path()
-    with locked_path(path):
-        with open(path, encoding="utf-8") as handle:
-            config = yaml.safe_load(handle) or {}
-        if not isinstance(config, dict):
-            raise ValueError("config.yaml 顶层必须是映射")
-
-        existing_model = config.get("model") or {}
-        if not isinstance(existing_model, dict):
-            existing_model = {}
-
-        # `record.provider` may be an inferred Feishu display label (e.g. ARK).
-        # Hermes still treats URL-backed records as custom providers.
-        record_provider = "custom"
-        provider = record_provider
-
-        model = {
-            "default": record["model"],
-            "provider": provider,
-            "base_url": record["base_url"].rstrip("/"),
-            "api_key": record["api_key"],
-        }
-
-        limits = model_limits(record["model"])
-        if limits:
-            model["model_config"] = limits
-        config["model"] = model
-        temp = path.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
-        try:
-            with open(temp, "w", encoding="utf-8", newline="\n") as handle:
-                yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
-                handle.flush()
-                os.fsync(handle.fileno())
-            os.replace(temp, path)
-        finally:
-            if temp.exists():
-                temp.unlink()
-    return path
 
 
 @contextmanager

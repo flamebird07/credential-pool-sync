@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.11.1 adds GitHub sync procedure, git corruption recovery, and terminal failure workaround."
-version: 7.11.1
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.12.0 adds Responses API support for health checks (glm-4-7-251222 fix)."
+version: 7.12.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.11.0
+# Credential Pool Sync v7.12.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -371,6 +371,13 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.12.0 (2026-08-03)
+
+- **Added Responses API support to health checks**: endpoint_candidates() now probes /responses before /chat/completions and /messages. tk() sends Responses API request body for /responses endpoints. Fixes glm-4-7-251222 and other ARK/OpenAI Responses API models being incorrectly classified as "不可用".
+- **Updated _strip_endpoint_suffix()**: Added /v1/responses, /v3/responses, /responses suffix stripping.
+- **Updated endpoint_base_url()**: Added /responses suffix recognition.
+- **Fixed HTTP 404 handling in tk()**: Changed from immediate return to continue, so a 404 on one protocol does not prevent trying other protocols.
 
 ### v7.11.1 (2026-08-01)
 

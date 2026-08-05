@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile Feishu credential status with the active Hermes model v7.11.0 — 飞书状态管理优化 + Provider 反推修复"""
+"""Reconcile Feishu credential status with the active Hermes model v7.12.0 — 飞书状态管理优化 + Provider 反推修复"""
 
 import os
 import sys

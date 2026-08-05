@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.11.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
+"""凭证池同步脚本 v7.12.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -676,6 +676,59 @@ def cleanup_custom_providers():
             print(f"  ✅ custom_providers: {len(custom_providers)} 条，无过期条目")
 
 
+def update_runtime_main_model(record):
+    path = get_runtime_config_path()
+    with locked_path(path):
+        with open(path, encoding="utf-8") as handle:
+            config = yaml.safe_load(handle) or {}
+        if not isinstance(config, dict):
+            raise ValueError("config.yaml 顶层必须是映射")
+
+        # Use the record's own provider (already inferred from the URL when the
+        # Feishu field was empty), falling back to the Hermes custom provider.
+        provider = str(record.get("provider") or "").strip() or HERMES_CUSTOM_PROVIDER
+
+        model_name = str(record.get("model") or "").strip()
+        base_url = normalise_base_url(record.get("base_url"))
+        api_key = str(record.get("api_key") or "").strip()
+        if not model_name:
+            raise ValueError("record 缺少 model 字段")
+        if not base_url:
+            raise ValueError("record 缺少 base_url 字段")
+        if not api_key:
+            raise ValueError("record 缺少 api_key 字段")
+
+        model = {
+            "default": model_name,
+            "provider": provider,
+            "base_url": base_url,
+            "api_key": api_key,
+        }
+
+        limits = model_limits(model_name)
+        if limits:
+            existing_mc = (config.get("model") or {}).get("model_config") or {}
+            existing_mc.update(limits)
+            model["model_config"] = existing_mc
+        existing = config.get("model") or {}
+        if isinstance(existing, dict):
+            existing.update(model)
+            config["model"] = existing
+        else:
+            config["model"] = model
+        temp = path.with_suffix(f".yaml.{uuid.uuid4().hex}.tmp")
+        try:
+            with open(temp, "w", encoding="utf-8", newline="\n") as handle:
+                yaml.safe_dump(config, handle, allow_unicode=True, sort_keys=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp, path)
+        finally:
+            if temp.exists():
+                temp.unlink()
+    return path
+
+
 def _priority(value):
     try:
         return int(value)
@@ -736,7 +789,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.11.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.12.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     fe, vc, r_limit, ic, output_records, pending_updates = {}, 0, 0, 0, [], []
@@ -752,7 +805,7 @@ def _sync_unlocked(skip_health_rotate=False):
     current_identity = (
         str(current_model.get("api_key", "") or "").strip(),
         str(current_model.get("base_url", "") or "").strip().lower().rstrip("/"),
-        str(current_model.get("default", "") or "").strip(),
+        str(current_model.get("default", "") or "").strip().lower(),
     )
     for r in rs:
         f = r.get("fields") or {}; rid = r.get("record_id", "")
@@ -907,7 +960,7 @@ def _sync_unlocked(skip_health_rotate=False):
         (
             str(record.get('api_key', '')).strip(),
             normalise_base_url(record.get('base_url', '')),
-            record.get('model', ''),
+            str(record.get('model', '')).strip().lower(),
         ) == (
             current_identity[0],
             normalise_base_url(current_identity[1]),
@@ -917,11 +970,57 @@ def _sync_unlocked(skip_health_rotate=False):
     )
 
     if not current_in_pool:
-        print(
-            'WARNING: 当前主模型不在最终有效凭证池中，'
-            '建议运行 scripts/switch_next.py 切换到下一个可用凭证',
-            file=sys.stderr,
-        )
+        # 从 output_records 中筛选非当前identity的候选
+        candidates = [
+            record for record in output_records
+            if (
+                str(record.get('api_key', '')).strip(),
+                normalise_base_url(record.get('base_url', '')),
+                str(record.get('model', '')).strip().lower(),
+            ) != (
+                current_identity[0],
+                normalise_base_url(current_identity[1]),
+                current_identity[2],
+            )
+        ]
+        if candidates:
+            # 取第一个候选（已按priority排序）自动切换
+            target = candidates[0]
+            try:
+                update_runtime_main_model(target)
+                print(f"🔄 主模型已自动切换: {target.get('label') or target['model']}")
+            except Exception as exc:
+                print(f"WARNING: 自动切换失败: {exc}", file=sys.stderr)
+                print(
+                    'WARNING: 当前主模型不在最终有效凭证池中，'
+                    '建议运行 scripts/switch_next.py 切换到下一个可用凭证',
+                    file=sys.stderr,
+                )
+            else:
+                # 回写飞书状态：新目标。与主模型切换相互独立——状态回写失败
+                # 不应被误报为切换失败。
+                if not skip_health_rotate and target.get('record_id'):
+                    try:
+                        token = gt()
+                        records_list = gr(token)
+                        new_r = next(
+                            (r for r in records_list if r["record_id"] == target["record_id"]),
+                            None
+                        )
+                        if new_r:
+                            current_status = new_r.get("fields", {}).get("状态", "")
+                            new_status = status_add(current_status, agent_name)
+                            existing_note = new_r.get("fields", {}).get("备注") or ""
+                            note = None if existing_note.strip() else "验证通过"
+                            us(token, target["record_id"], new_status, note=note)
+                    except Exception as exc:
+                        print(f"WARNING: 回写飞书状态失败: {exc}", file=sys.stderr)
+        else:
+            print(
+                'WARNING: 当前主模型不在最终有效凭证池中，'
+                '建议运行 scripts/switch_next.py 切换到下一个可用凭证',
+                file=sys.stderr,
+            )
     print("__RECORDS__" + json.dumps(output_records, ensure_ascii=False, separators=(",", ":")))
 
 
