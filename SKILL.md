@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.12.0 adds Responses API support for health checks (glm-4-7-251222 fix)."
-version: 7.12.0
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials."
+version: 7.13.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.12.0
+# Credential Pool Sync v7.13.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -28,6 +28,28 @@ This skill was optimized using the user's required four-step method:
 4. **Step 4: MiMo Code Review** - Verified implementation and identified issues
 
 The method requires strict separation: reviewers cannot be implementers, and each step must be completed before the next. See `references/four-step-method-execution.md` for detailed execution patterns.
+
+## Setup / Deployment
+
+After installing the skill on a new machine, run **once** to complete full deployment:
+
+```bash
+cd %LOCALAPPDATA%\hermes\skills\devops\credential-pool-sync
+python scripts/setup.py
+```
+
+This automatically does:
+1. Checks Feishu credentials are present in config.yaml or environment variables
+2. Runs a full first sync (health check + auth.json + fallback_providers + switch to a healthy model)
+3. Registers a cron job to sync every 2 hours (`0 */2 * * *`, silent delivery)
+4. Configures gateway startup hooks to auto-run `auto_bootstrap.py` on gateway restart
+
+Additional options:
+- `--skip-cron` - Skip registering the cron job
+- `--skip-bootstrap` - Skip configuring the gateway startup hook
+- `--sync-only` - Only run the first sync (equivalent to both above)
+
+The script is idempotent—re-running it is safe and won't duplicate cron jobs or startup hooks.
 
 ## Trigger matrix
 
@@ -371,6 +393,17 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.13.0 (2026-08-06)
+
+- **Added priority tier-based reading**: Records in the Feishu table must have a priority integer 0-9 (smallest = highest priority). Synchronization now reads only one tier at a time, starting from tier 0. If all records in a tier are invalid, advances to the next tier (1, 2, ... 9). When a lower tier has valid credentials, higher tier credentials are never loaded locally.
+- **Added `priority()` function**: Unified 0-9 normalization across all scripts. Out-of-range or non-integer values are clamped to tier 9 (lowest) with a stderr warning. Never drops records or promotes priority.
+- **Added `group_by_priority()` function**: Groups normalized records by priority tier (0-9), returning `{tier: [records]}`.
+- **Added `collect_active_tier()` function**: Shared tier-by-tier health check. Starting from tier 0, health-checks each tier's records and returns the first tier with ≥1 valid credential. Tiers above the active tier are never health-checked or read. Handles `skip_health_rotate` mode (all records valid, active tier = lowest non-empty tier).
+- **Refactored `_sync_unlocked()`**: Replaced full-scan loop with `collect_active_tier()` call. auth.json credential_pool, fallback_providers, and main model switch candidates are now limited to the active tier only.
+- **Updated `sync_fallback_providers()`**: Now receives only active-tier raw records instead of all records.
+- **Updated `switch_next.py`**: Imports `priority`, `group_by_priority`, `collect_active_tier` from `sync_credential_pool`. `first_healthy()` narrows candidates to active tier before selection.
+- **Updated `auto_bootstrap.py`**: Same imports. `try_switch()` narrows to active tier. `main()` triggers a full sync (without `--skip-health-rotate`) to advance tiers when active tier fails.
 
 ### v7.12.0 (2026-08-03)
 

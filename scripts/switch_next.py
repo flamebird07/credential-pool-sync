@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.12.0 — 含飞书状态管理优化 + Provider 反推修复"""
+"""切换到下一个可用凭证 v7.13.0 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 
@@ -20,6 +20,10 @@ from sync_credential_pool import (
     tk,
     endpoint_candidates,
     update_runtime_main_model,
+    priority,
+    group_by_priority,
+    collect_active_tier,
+    identity as pool_identity,
 )
 
 BASE_TOKEN = "YedtbFYKZatu2QsGti9ch7xbnGc"
@@ -181,7 +185,7 @@ def _normalise_record(record):
     api_key = str(fields.get("API Key", "") or "").strip()
     base_url = normalise_base_url(fields.get("Base URL", ""))
     model = str(fields.get("模型", "") or "").strip()
-    priority = _priority(fields.get("优先级", ""))
+    pr = priority(fields.get("优先级", ""))
     # glm-5-2 在 ARK 上必须使用 /api/v3 端点
     if model.lower().startswith("glm-5-2") and base_url == "https://ark.cn-beijing.volces.com/api":
         base_url = "https://ark.cn-beijing.volces.com/api/v3"
@@ -197,15 +201,9 @@ def _normalise_record(record):
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
-        "priority": priority,
+        "priority": pr,
         "status": str(fields.get("状态", "") or "").strip(),
     }
-
-def _priority(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 99
 
 def get_current_model_config():
     """获取当前主模型配置"""
@@ -231,7 +229,24 @@ def first_healthy(records, current, token=None):
                 old_record = record
                 break
 
-    for record in ordered_candidates(records, current):
+    # 收窄到 active 档（优先级最高且存在有效凭证的档），只在此档内选候选
+    by_tier = group_by_priority(records)
+    _active_tier, active_valid, _health_results, tier_pending, _healed, _url_updates = collect_active_tier(
+        by_tier,
+        current_identity=pool_identity(
+            (current or {}).get("api_key", ""),
+            (current or {}).get("base_url", ""),
+            (current or {}).get("default", ""),
+        ),
+        agent_name=get_agent_name(),
+    )
+    # 回写收窄过程产生的状态更新（低档位健康检查失败/限流等）
+    if token:
+        for record_id, new_status, note in tier_pending:
+            if record_id:
+                us(token, record_id, new_status, note=(note or None))
+
+    for record in ordered_candidates(active_valid, current):
         if not record.get("api_key") or not record.get("base_url"):
             continue
         is_valid, status, error, _used_url = tk(

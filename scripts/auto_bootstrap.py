@@ -32,23 +32,25 @@ from sync_credential_pool import (
     status_remove,
     tk,
     us,
+    priority,
+    group_by_priority,
+    collect_active_tier,
+    identity as pool_identity,
 )
 
 
-def priority(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 99
-
-
-def run_sync():
+def run_sync(full=False):
+    """Run sync_credential_pool.py. Default fast skip-mode fill; full=True runs a
+    real health-checked sync (no --skip-health-rotate) to advance to the next tier."""
     script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sync_credential_pool.py")
+    cmd = [sys.executable, script]
+    if not full:
+        cmd.append("--skip-health-rotate")
     result = subprocess.run(
-        [sys.executable, script, "--skip-health-rotate"],
+        cmd,
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=(240 if full else 60),
         encoding="utf-8",
         errors="replace",
     )
@@ -121,6 +123,20 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
 
         if attempt > 0 and deferred_records:
             records = records + deferred_records
+
+        # 收窄到 active 档（优先级最高且存在有效凭证的档），只在该档内选候选
+        by_tier = group_by_priority(records)
+        _active_tier, active_valid, _health_results, _tier_pending, _healed, _url_updates = collect_active_tier(
+            by_tier,
+            current_identity=pool_identity(
+                current.get("api_key", ""),
+                current.get("base_url", ""),
+                current.get("default", ""),
+            ),
+            agent_name=get_agent_name(),
+        )
+        records = active_valid
+
         for record in records:
             record["base_url"] = str(record.get("base_url", "")).strip().lower().rstrip("/")
             if any(not record.get(field) for field in ("model", "base_url", "api_key")):
@@ -202,53 +218,58 @@ def report_exhaustion(records, old_identity):
 def main():
     rotation_lock = Path(__file__).with_name(".rotation")
     deferred_records = []
+    records = []
     try:
-        for attempt in range(2):
-            records = run_sync()
-            record, path, old_identity = try_switch(records, attempt, deferred_records, rotation_lock)
-            if record is not None:
-                label = record.get("label") or record["model"]
-                print(f"Switched to [{label}]; updated {path}")
-                record_id = record.get("record_id")
-                if record_id:
-                    try:
-                        token = gt()
-                        agent_name = get_agent_name()
-                        # 从 records 中找到旧凭证的 record_id
-                        old_record_id = None
-                        if old_identity:
-                            for candidate in records:
-                                candidate_identity = (
-                                    candidate.get("api_key", ""),
-                                    str(candidate.get("base_url", "")).strip().lower().rstrip("/"),
-                                    candidate.get("model", ""),
-                                )
-                                if candidate_identity == old_identity:
-                                    old_record_id = candidate.get("record_id")
-                                    break
-
-                        feishu_records = gr(token)
-
-                        # 先清理旧凭证的 Agent 标记
-                        if old_record_id and old_record_id != record_id:
-                            for r in feishu_records:
-                                if r["record_id"] == old_record_id:
-                                    old_status = r.get("fields", {}).get("状态", "")
-                                    cleaned_status = status_remove(old_status, agent_name)
-                                    us(token, old_record_id, cleaned_status)
-                                    break
-
-                        # 再更新新凭证的 Agent 标记
-                        for r in feishu_records:
-                            if r["record_id"] == record_id:
-                                new_status = status_add(r.get("fields", {}).get("状态", ""), agent_name)
-                                us(token, record_id, new_status, note="验证通过")
+        # 首轮：skip 快速填充，只健康检查最低非空档
+        records = run_sync()
+        record, path, old_identity = try_switch(records, 0, deferred_records, rotation_lock)
+        if record is None:
+            # active 档全部健康检查失败：触发一次完整同步（不带 --skip-health-rotate）
+            # 推进档位后重试
+            print("No available credential in active tier; running full sync to advance tier...")
+            records = run_sync(full=True)
+            record, path, old_identity = try_switch(records, 1, deferred_records, rotation_lock)
+        if record is not None:
+            label = record.get("label") or record["model"]
+            print(f"Switched to [{label}]; updated {path}")
+            record_id = record.get("record_id")
+            if record_id:
+                try:
+                    token = gt()
+                    agent_name = get_agent_name()
+                    # 从 records 中找到旧凭证的 record_id
+                    old_record_id = None
+                    if old_identity:
+                        for candidate in records:
+                            candidate_identity = (
+                                candidate.get("api_key", ""),
+                                str(candidate.get("base_url", "")).strip().lower().rstrip("/"),
+                                candidate.get("model", ""),
+                            )
+                            if candidate_identity == old_identity:
+                                old_record_id = candidate.get("record_id")
                                 break
-                    except Exception as exc:
-                        print(f"WARNING: failed to update Feishu credential statuses: {exc}", file=sys.stderr)
-                return 0
-            if attempt == 0:
-                print("No available credential; syncing and retrying once")
+
+                    feishu_records = gr(token)
+
+                    # 先清理旧凭证的 Agent 标记
+                    if old_record_id and old_record_id != record_id:
+                        for r in feishu_records:
+                            if r["record_id"] == old_record_id:
+                                old_status = r.get("fields", {}).get("状态", "")
+                                cleaned_status = status_remove(old_status, agent_name)
+                                us(token, old_record_id, cleaned_status)
+                                break
+
+                    # 再更新新凭证的 Agent 标记
+                    for r in feishu_records:
+                        if r["record_id"] == record_id:
+                            new_status = status_add(r.get("fields", {}).get("状态", ""), agent_name)
+                            us(token, record_id, new_status, note="验证通过")
+                            break
+                except Exception as exc:
+                    print(f"WARNING: failed to update Feishu credential statuses: {exc}", file=sys.stderr)
+            return 0
     except (OSError, subprocess.SubprocessError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1

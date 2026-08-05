@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.12.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
+"""凭证池同步脚本 v7.13.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -729,11 +729,18 @@ def update_runtime_main_model(record):
     return path
 
 
-def _priority(value):
+def priority(value):
+    """Normalised 0-9. Out-of-range / non-integer -> 9 (lowest) + warning.
+    0 is highest priority, 9 is lowest. Never drops a record; never promotes it."""
     try:
-        return int(value)
+        p = int(value)
     except (TypeError, ValueError):
-        return 99
+        print(f"WARNING: 非法优先级 {value!r}，按档 9 处理", file=sys.stderr)
+        return 9
+    if not (0 <= p <= 9):
+        print(f"WARNING: 优先级 {p} 越界，按档 9 处理", file=sys.stderr)
+        return 9
+    return p
 
 
 def normalise_base_url(value):
@@ -764,11 +771,12 @@ def _normalise_record(record):
     api_key = str(fields.get("API Key", "") or "").strip()
     base_url = normalise_base_url(fields.get("Base URL", ""))
     model = str(fields.get("模型", "") or "").strip()
-    priority = _priority(fields.get("优先级", ""))
+    pr = priority(fields.get("优先级", ""))
     # glm-5-2 在 ARK 上必须使用 /api/v3 端点
     if model.lower().startswith("glm-5-2") and base_url == "https://ark.cn-beijing.volces.com/api":
         base_url = "https://ark.cn-beijing.volces.com/api/v3"
     # 反推 Provider：如果 Feishu 的 Provider 字段为空或为 "custom"，但从 URL 能推断出标准 Provider，则覆盖
+    original_provider = provider
     inferred = detect_provider(base_url)
     if inferred and (not provider or provider.lower() == "custom"):
         provider = inferred
@@ -778,12 +786,111 @@ def _normalise_record(record):
         "record_id": record.get("record_id", ""),
         "label": label,
         "provider": provider,
+        "original_provider": original_provider,
         "model": model,
         "base_url": base_url,
         "api_key": api_key,
-        "priority": priority,
+        "priority": pr,
         "status": str(fields.get("状态", "") or "").strip(),
     }
+
+def group_by_priority(records):
+    """按 0-9 分档归一化后的凭证记录，返回 {tier: [rec,...]}。
+
+    0 档优先级最高，9 档最低。空档位保留空列表。
+    """
+    groups = {tier: [] for tier in range(10)}
+    for rec in records:
+        groups[rec["priority"]].append(rec)
+    return groups
+
+
+def collect_active_tier(records_by_tier, skip_health_rotate=False, *, current_identity, agent_name):
+    """从档 0 起逐档健康检查，返回第一个含 ≥1 有效凭证的档。
+
+    - 只健康检查 0..active 档；active 之上的档完全不检查、不读取。
+    - 0 档优先级最高；只要该档存在至少一个有效凭证就只加载该档。
+    - skip_health_rotate 时所有记录视为有效，active_tier = 最低的非空档。
+
+    返回 (active_tier_or_None, active_valid_records, health_results,
+          pending_updates, healed_urls, url_updates)。
+    """
+    health_results = {} if not skip_health_rotate else None
+    pending_updates = []
+    healed_urls = {}
+    url_updates = []
+    active_tier = None
+    active_valid_records = []
+
+    for tier in range(10):
+        tier_records = records_by_tier.get(tier, [])
+        if not tier_records:
+            continue
+        valid_in_tier = []
+        for normalised in tier_records:
+            p = normalised["provider"]
+            l = normalised["label"]
+            ak = normalised["api_key"]
+            bu = normalised["base_url"]
+            m = normalised["model"]
+            rid = normalised.get("record_id", "")
+            original_provider = str(normalised.get("original_provider") or "").strip()
+            detected_provider = detect_provider(bu)
+            if skip_health_rotate:
+                iv, s, e, _used_url = True, S_A, None, ""
+            else:
+                print(f"\n  🔍 [{l or p}] ...", end=" ")
+                iv, s, e, _used_url = tk(p, ak, bu, m)
+                if iv:
+                    healed_url = endpoint_base_url(_used_url)
+                    if healed_url and healed_url != bu:
+                        healed_urls[identity(ak, bu, m)] = healed_url
+                        url_updates.append((rid, detected_provider or p, healed_url))
+                        normalised["base_url"] = healed_url
+                        bu = healed_url
+                    if detected_provider and (
+                        not original_provider or original_provider.lower() == "custom"
+                    ):
+                        url_updates.append((rid, detected_provider, bu))
+                        normalised["provider"] = detected_provider
+                        p = detected_provider
+            if health_results is not None:
+                health_results[identity(ak, bu, m)] = (iv, s, e, _used_url)
+            if s == S_R:
+                if not skip_health_rotate:
+                    print(f"⛔ {s}")
+                    new_status = health_status(False, s, e)
+                    h_note = e or "额度已用完"
+                    pending_updates.append((rid, new_status, h_note))
+                continue
+            if iv:
+                if not skip_health_rotate:
+                    print(f"✅ {s}")
+                    # 状态栏显示 Agent 使用信息，备注保留原始说明
+                    if identity(ak, bu, m) == current_identity:
+                        new_status = status_add(normalised.get("status") or "", agent_name)
+                    else:
+                        new_status = status_remove(normalised.get("status") or "", agent_name)
+                    h_note = "验证通过"
+                    pending_updates.append((rid, new_status, h_note))
+                valid_in_tier.append(normalised)
+            else:
+                # 健康检查失败时，设置正确的健康状态，从状态栏移除当前 Agent
+                new_status = health_status(False, s, e)
+                h_note = e or s
+                if "404" in str(e or ""):
+                    h_note = "HTTP 404: model or account entitlement unavailable"
+                print(f"❌ {s}")
+                pending_updates.append((rid, new_status, h_note))
+            if not skip_health_rotate:
+                time.sleep(0.3)
+        if valid_in_tier:
+            active_tier = tier
+            active_valid_records = valid_in_tier
+            break
+
+    return (active_tier, active_valid_records, health_results, pending_updates, healed_urls, url_updates)
+
 
 def _read_existing_auth():
     """Read auth.json safely and retain unrelated top-level settings."""
@@ -802,13 +909,12 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.12.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.13.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
-    fe, vc, r_limit, ic, output_records, pending_updates = {}, 0, 0, 0, [], []
+    pending_updates = []
     url_updates = []
     healed_urls = {}
-    health_results = {} if not skip_health_rotate else None
     agent_name = get_agent_name()
     with open(get_runtime_config_path(), encoding="utf-8") as handle:
         current_config = yaml.safe_load(handle) or {}
@@ -830,8 +936,11 @@ def _sync_unlocked(skip_health_rotate=False):
                 if cleaned != f.get("状态", ""):
                     pending_updates.append((rid, cleaned, None))
 
+    # 归一化所有记录并按优先级分档（0-9，0 最高）
+    normalised_all = []
     for r in rs:
-        f = r.get("fields") or {}; rid = r.get("record_id", "")
+        f = r.get("fields") or {}
+        rid = r.get("record_id", "")
         normalised = _normalise_record(r)
         if normalised is None:
             label = str(f.get("Label", "") or f.get("Provider", "") or "").strip()
@@ -839,68 +948,41 @@ def _sync_unlocked(skip_health_rotate=False):
             if not skip_health_rotate and rid:
                 pending_updates.append((rid, S_I, None))
             continue
-        p = normalised["provider"]; l = normalised["label"]; ak = normalised["api_key"]
-        bu = normalised["base_url"]; m = normalised["model"]; pr = normalised["priority"]
-        detected_provider = detect_provider(bu)
-        original_provider = str(f.get("Provider", "") or "").strip()
-        # 注意: 不要修改 api/plan → api/plan/v3
-        # 诊断证明 api/plan 配合 /v1/chat/completions 是正确的端点
-        # api/plan/v3 反而导致 404
-        if skip_health_rotate:
-            iv, s, e, _used_url = True, S_A, None, ""
-        else:
-            print(f"\n  🔍 [{l or p}] ...", end=" ")
-            iv, s, e, _used_url = tk(p, ak, bu, m)
-            if iv:
-                healed_url = endpoint_base_url(_used_url)
-                if healed_url and healed_url != bu:
-                    healed_urls[identity(ak, bu, m)] = healed_url
-                    url_updates.append((rid, detected_provider or p, healed_url))
-                    normalised["base_url"] = healed_url
-                    bu = healed_url
-                if detected_provider and (
-                    not original_provider or original_provider.lower() == "custom"
-                ):
-                    url_updates.append((rid, detected_provider, bu))
-                    normalised["provider"] = detected_provider
-                    p = detected_provider
-        if health_results is not None:
-            health_results[identity(ak, bu, m)] = (iv, s, e, _used_url)
-        if s == S_R:
-            if not skip_health_rotate:
-                print(f"⛔ {s}")
-                new_status = health_status(False, s, e)
-                h_note = e or "额度已用完"
-                pending_updates.append((rid, new_status, h_note))
-            r_limit += 1
-            continue
-        if iv:
-            if not skip_health_rotate:
-                print(f"✅ {s}")
-                # 状态栏显示 Agent 使用信息，备注保留原始说明
-                if identity(ak, bu, m) == current_identity:
-                    new_status = status_add(f.get("状态", ""), agent_name)
-                else:
-                    new_status = status_remove(f.get("状态", ""), agent_name)
-                h_note = "验证通过"
-                pending_updates.append((rid, new_status, h_note))
-            vc += 1
-            output_records.append(normalised)
-            rid_full = r.get("record_id", "")
-            eid = f"sync-{rid_full}" if rid_full else f"sync-{uuid.uuid4().hex[:12]}"
-            pk = _hermes_pool_key(p)
-            hermes_provider = HERMES_CUSTOM_PROVIDER
-            fe.setdefault(pk, []).append({"id": eid, "label": l or m, "provider": hermes_provider, "model": m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "access_token": ak, "api_key": ak, "last_status": "active", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
-        else:
-            # 健康检查失败时，设置正确的健康状态，从状态栏移除当前 Agent
-            new_status = health_status(False, s, e)
-            h_note = e or s
-            if "404" in str(e or ""):
-                h_note = "HTTP 404: model or account entitlement unavailable"
-            print(f"❌ {s}"); ic += 1
-            pending_updates.append((rid, new_status, h_note))
-        if not skip_health_rotate:
-            time.sleep(0.3)
+        normalised_all.append(normalised)
+    records_by_tier = group_by_priority(normalised_all)
+
+    # 逐档健康检查：只加载优先级最高且存在有效凭证的档（0 档最高）
+    active_tier, active_valid_records, health_results, tier_pending, healed_urls, url_updates = collect_active_tier(
+        records_by_tier,
+        skip_health_rotate=skip_health_rotate,
+        current_identity=current_identity,
+        agent_name=agent_name,
+    )
+    pending_updates.extend(tier_pending)
+
+    # 只由 active 档有效凭证构建 credential_pool 与 output_records
+    fe = {}
+    output_records = list(active_valid_records)
+    for normalised in active_valid_records:
+        p = normalised["provider"]
+        l = normalised["label"]
+        m = normalised["model"]
+        bu = normalised["base_url"]
+        ak = normalised["api_key"]
+        pr = normalised["priority"]
+        rid_full = normalised.get("record_id", "")
+        eid = f"sync-{rid_full}" if rid_full else f"sync-{uuid.uuid4().hex[:12]}"
+        pk = _hermes_pool_key(p)
+        fe.setdefault(pk, []).append({"id": eid, "label": l or m, "provider": HERMES_CUSTOM_PROVIDER, "model": m, "auth_type": "api_key", "priority": pr, "source": f"manual:{ak[:12]}...", "access_token": ak, "api_key": ak, "last_status": "active", "base_url": bu, "request_count": 0, "secret_fingerprint": f"sha256:{eid}"})
+
+    vc = len(active_valid_records)
+    r_limit = ic = 0
+    if health_results is not None:
+        for result in health_results.values():
+            if not result[0] and result[1] == S_R:
+                r_limit += 1
+            elif not result[0]:
+                ic += 1
     print(f"\n{'='*50}\n✅ {vc} 有效 | ⛔ {r_limit} 限流 | ❌ {ic} 无效")
     AUTH_JSON.parent.mkdir(parents=True, exist_ok=True)
     with locked_path(AUTH_JSON):
@@ -918,6 +1000,7 @@ def _sync_unlocked(skip_health_rotate=False):
             candidate_pool[pv] = es
         new_pool_count = sum(len(entries) for entries in candidate_pool.values())
 
+        # preserve_existing_pool 判定沿用 active 档的 checked/unavailable 计数
         checked_count = len(health_results) if health_results is not None else 0
         unavailable_count = (
             sum(
@@ -955,9 +1038,15 @@ def _sync_unlocked(skip_health_rotate=False):
         finally:
             if temp_auth.exists():
                 temp_auth.unlink()
-    # 同步 fallback_providers：所有非视觉模型加入 fallback 链
-    sync_fallback_providers(rs, health_results, healed_urls)
-    # 清理 custom_providers 中的过期端点
+    # 同步 fallback_providers：只加载 active 档的非视觉模型
+    active_raw_records = []
+    if active_tier is not None:
+        for r in rs:
+            fields = r.get("fields") or {}
+            if priority(fields.get("优先级", "")) == active_tier:
+                active_raw_records.append(r)
+    sync_fallback_providers(active_raw_records, health_results, healed_urls)
+    # 清理 custom_providers 中的过期端点（fallback 已收敛到 active 档，不会误删高档 provider）
     if not skip_health_rotate:
         cleanup_custom_providers()
     if not skip_health_rotate:
@@ -976,7 +1065,7 @@ def _sync_unlocked(skip_health_rotate=False):
     else:
         print("\n\n⚠️ 无有效凭证，已清空 credential_pool")
     if not skip_health_rotate:
-        cleanup_fallback_chain(rs, health_results)
+        cleanup_fallback_chain(active_raw_records, health_results)
     print(f"\n{'='*50}\n✅ 同步完成\n{'='*50}")
     output_records.sort(key=lambda item: item["priority"])
     current_in_pool = any(
@@ -984,6 +1073,7 @@ def _sync_unlocked(skip_health_rotate=False):
         for record in output_records
     )
     if not current_in_pool:
+        # 主模型切换候选只从 active 档选
         candidates = [
             record for record in output_records
             if identity(record.get("api_key", ""), record.get("base_url", ""), record.get("model", "")) != current_identity
