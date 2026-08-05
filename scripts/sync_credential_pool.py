@@ -523,10 +523,10 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
             config = yaml.safe_load(handle) or {}
         current_model = config.get("model") or {}
         if isinstance(current_model, dict):
-            current_main_model = (
-                str(current_model.get("api_key", "") or "").strip(),
-                str(current_model.get("base_url", "") or "").strip().lower().rstrip("/"),
-                str(current_model.get("default", "") or "").strip(),
+            current_main_model = identity(
+                current_model.get("api_key", ""),
+                current_model.get("base_url", ""),
+                current_model.get("default", ""),
             )
     except Exception:
         pass
@@ -538,7 +538,7 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
         model = rec.get("model", "")
         base_url = rec.get("base_url", "")
         api_key = rec.get("api_key", "")
-        original_identity = (api_key, base_url, model)
+        original_identity = identity(api_key, base_url, model)
         if original_identity in healed_urls:
             base_url = healed_urls[original_identity]
         
@@ -552,9 +552,9 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
             continue
         
         # 跳过健康检查确认无效或限流的模型
-        identity = (api_key, base_url, model)
+        identity_key = identity(api_key, base_url, model)
         if health_results is not None:
-            result = health_results.get(identity)
+            result = health_results.get(identity_key)
             if result and not result[0]:
                 status = result[1]
                 # Do not put a route with a confirmed model/access 404 into
@@ -564,7 +564,7 @@ def sync_fallback_providers(raw_records, health_results=None, healed_urls=None):
                     continue
             
         # 跳过当前主模型（避免重复）
-        if current_main_model and identity == current_main_model:
+        if current_main_model and identity_key == current_main_model:
             continue
 
         # 去重: (model, base_url, api_key)
@@ -744,6 +744,19 @@ def normalise_base_url(value):
     return base_url
 
 
+def identity(api_key, base_url, model):
+    """Unified credential identity: (api_key, normalised_base_url, lowered_model).
+
+    All identity comparisons across sync, fallback, switch, and cleanup scripts
+    MUST use this function to avoid format mismatches.
+    """
+    return (
+        str(api_key or "").strip(),
+        normalise_base_url(base_url),
+        str(model or "").strip().lower(),
+    )
+
+
 def _normalise_record(record):
     fields = record.get("fields") or {}
     provider = str(fields.get("Provider", "") or "").strip()
@@ -802,11 +815,21 @@ def _sync_unlocked(skip_health_rotate=False):
     current_model = current_config.get("model") or {}
     if not isinstance(current_model, dict):
         current_model = {}
-    current_identity = (
-        str(current_model.get("api_key", "") or "").strip(),
-        str(current_model.get("base_url", "") or "").strip().lower().rstrip("/"),
-        str(current_model.get("default", "") or "").strip().lower(),
+    current_identity = identity(
+        current_model.get("api_key", ""),
+        current_model.get("base_url", ""),
+        current_model.get("default", ""),
     )
+    # Clean stale markers for this agent from all records before re-applying
+    if not skip_health_rotate:
+        for r in rs:
+            f = r.get("fields") or {}
+            rid = r.get("record_id", "")
+            if rid and agent_name in agents(f.get("状态", "")):
+                cleaned = status_remove(f.get("状态", ""), agent_name)
+                if cleaned != f.get("状态", ""):
+                    pending_updates.append((rid, cleaned, None))
+
     for r in rs:
         f = r.get("fields") or {}; rid = r.get("record_id", "")
         normalised = _normalise_record(r)
@@ -831,7 +854,7 @@ def _sync_unlocked(skip_health_rotate=False):
             if iv:
                 healed_url = endpoint_base_url(_used_url)
                 if healed_url and healed_url != bu:
-                    healed_urls[(ak, bu, m)] = healed_url
+                    healed_urls[identity(ak, bu, m)] = healed_url
                     url_updates.append((rid, detected_provider or p, healed_url))
                     normalised["base_url"] = healed_url
                     bu = healed_url
@@ -842,7 +865,7 @@ def _sync_unlocked(skip_health_rotate=False):
                     normalised["provider"] = detected_provider
                     p = detected_provider
         if health_results is not None:
-            health_results[(ak, bu, m)] = (iv, s, e, _used_url)
+            health_results[identity(ak, bu, m)] = (iv, s, e, _used_url)
         if s == S_R:
             if not skip_health_rotate:
                 print(f"⛔ {s}")
@@ -855,7 +878,7 @@ def _sync_unlocked(skip_health_rotate=False):
             if not skip_health_rotate:
                 print(f"✅ {s}")
                 # 状态栏显示 Agent 使用信息，备注保留原始说明
-                if (ak, bu, m) == current_identity:
+                if identity(ak, bu, m) == current_identity:
                     new_status = status_add(f.get("状态", ""), agent_name)
                 else:
                     new_status = status_remove(f.get("状态", ""), agent_name)
@@ -957,31 +980,13 @@ def _sync_unlocked(skip_health_rotate=False):
     print(f"\n{'='*50}\n✅ 同步完成\n{'='*50}")
     output_records.sort(key=lambda item: item["priority"])
     current_in_pool = any(
-        (
-            str(record.get('api_key', '')).strip(),
-            normalise_base_url(record.get('base_url', '')),
-            str(record.get('model', '')).strip().lower(),
-        ) == (
-            current_identity[0],
-            normalise_base_url(current_identity[1]),
-            current_identity[2],
-        )
+        identity(record.get("api_key", ""), record.get("base_url", ""), record.get("model", "")) == current_identity
         for record in output_records
     )
-
     if not current_in_pool:
-        # 从 output_records 中筛选非当前identity的候选
         candidates = [
             record for record in output_records
-            if (
-                str(record.get('api_key', '')).strip(),
-                normalise_base_url(record.get('base_url', '')),
-                str(record.get('model', '')).strip().lower(),
-            ) != (
-                current_identity[0],
-                normalise_base_url(current_identity[1]),
-                current_identity[2],
-            )
+            if identity(record.get("api_key", ""), record.get("base_url", ""), record.get("model", "")) != current_identity
         ]
         if candidates:
             # 取第一个候选（已按priority排序）自动切换
