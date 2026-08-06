@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.13.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
+"""凭证池同步脚本 v7.13.1 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -92,6 +92,8 @@ HERMES_CUSTOM_PROVIDER = "custom"
 
 def _hermes_pool_key(provider):
     pk = str(provider or "").strip().lower().replace(" ", "-")
+    if pk == HERMES_CUSTOM_PROVIDER:
+        return HERMES_CUSTOM_PROVIDER
     if pk not in STANDARD_PROVIDERS:
         pk = f"custom:{pk}"
     return pk
@@ -684,9 +686,8 @@ def update_runtime_main_model(record):
         if not isinstance(config, dict):
             raise ValueError("config.yaml 顶层必须是映射")
 
-        # Use the record's own provider (already inferred from the URL when the
-        # Feishu field was empty), falling back to the Hermes custom provider.
-        provider = str(record.get("provider") or "").strip() or HERMES_CUSTOM_PROVIDER
+        # The runtime model is always the Hermes custom provider.
+        provider = HERMES_CUSTOM_PROVIDER
 
         model_name = str(record.get("model") or "").strip()
         base_url = normalise_base_url(record.get("base_url"))
@@ -909,7 +910,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.13.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.13.1"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []

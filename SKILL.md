@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials."
-version: 7.13.0
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.13.1 fixes the custom:custom credential pool key."
+version: 7.13.1
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.13.0
+# Credential Pool Sync v7.13.1
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -103,8 +103,8 @@ When `_normalise_record()` correctly infers a standard Provider (e.g., "ARK") fr
 |---|---|---|---|
 | `sync_credential_pool.py` | `url_updates` | `if not original_provider and detected_provider:` | `if detected_provider and (not original_provider or original_provider.lower() == "custom"):` |
 | `switch_next.py` | `_normalise_record()` | `if not provider:` | `if not provider or provider.lower() == "custom":` |
-| `switch_next.py` | `update_runtime_main_model()` | `"provider": detect_provider(...) or "custom"` | `"provider": record.get("provider") or detect_provider(...) or "custom"` |
-| `auto_bootstrap.py` | `write_runtime_config()` | `"provider": detect_provider(...) or "custom"` | `"provider": record.get("provider") or detect_provider(...) or "custom"` |
+| `switch_next.py` | `update_runtime_main_model()` | `"provider": detect_provider(...) or "custom"` | `"provider": HERMES_CUSTOM_PROVIDER` (hardcoded, v7.9.0+) |
+| `auto_bootstrap.py` | `write_runtime_config()` | `"provider": detect_provider(...) or "custom"` | `"provider": "custom"` (hardcoded, already correct) |
 | `cleanup_feishu_status.py` | `cleanup_feishu_status()` | Provider never updated | Infer Provider, pass to `us()` alongside status |
 
 **Fix**: Every script that reads from Feishu and writes back must check for both empty and "custom" before inferring Provider. The `detect_provider()` fallback chain should be: `record.get("provider") or detect_provider(base_url) or "custom"`.
@@ -216,6 +216,26 @@ To repair existing Feishu records with empty or stale Provider fields:
 ```bash
 python scripts/cleanup_feishu_status.py --repair-provider
 ```
+
+### Pitfall: `custom:custom` credential pool key (v7.13.1)
+
+**Problem**: When a record's provider is already the bare `custom` value, `_hermes_pool_key()` prepended the `custom:` prefix again, producing a `custom:custom` key in `auth.json` instead of `custom`. Hermes pool lookups expect `{provider}:{name}` keys where the provider namespace is `custom` — a `custom:custom` key is either invisible to lookup or treated as a distinct bogus provider.
+
+**Root cause**: `_hermes_pool_key()` added `custom:` for every provider not in `STANDARD_PROVIDERS`. Since `custom` itself is not in the standard set, a provider already normalized to `custom` got double-prefixed.
+
+**Fix** (v7.13.1): `_hermes_pool_key()` returns `custom` directly when `pk == HERMES_CUSTOM_PROVIDER` before the standard-provider check. Non-standard providers other than `custom` still get the `custom:` prefix as before.
+
+```python
+def _hermes_pool_key(provider):
+    pk = str(provider or "").strip().lower().replace(" ", "-")
+    if pk == HERMES_CUSTOM_PROVIDER:
+        return HERMES_CUSTOM_PROVIDER
+    if pk not in STANDARD_PROVIDERS:
+        pk = f"custom:{pk}"
+    return pk
+```
+
+**Prevention**: When normalizing a provider to a pool key, treat the `custom` sentinel as a terminal value — never re-name it. Only non-standard providers that are *not* already `custom` should receive the namespace prefix.
 
 ## Feishu Status Field Rules
 
@@ -393,6 +413,12 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.13.1 (2026-08-07)
+
+- **Fixed `custom:custom` credential pool key**: `_hermes_pool_key()` previously produced `custom:custom` for the `custom` provider (the `custom:` prefix was prepended to a provider that was already "custom"). Now it returns bare `custom` directly when `pk == HERMES_CUSTOM_PROVIDER`. Prior to this, Hermes could show a `custom:custom` key in `auth.json`.
+- **Added version header to `auto_bootstrap.py`**: Docstring now carries the `v7.13.1` version, matching the other scripts.
+- **Bumped version strings** to `v7.13.1` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, and `SKILL.md`.
 
 ### v7.13.0 (2026-08-06)
 
