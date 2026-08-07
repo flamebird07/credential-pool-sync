@@ -1,6 +1,6 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.13.1 fixes the custom:custom credential pool key."
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.13.2 fixes the custom:custom credential pool key."
 version: 7.13.1
 author: Hermes Agent
 platforms: [windows]
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.13.1
+# Credential Pool Sync v7.13.2
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -217,13 +217,13 @@ To repair existing Feishu records with empty or stale Provider fields:
 python scripts/cleanup_feishu_status.py --repair-provider
 ```
 
-### Pitfall: `custom:custom` credential pool key (v7.13.1)
+### Pitfall: `custom:custom` credential pool key (v7.13.2)
 
 **Problem**: When a record's provider is already the bare `custom` value, `_hermes_pool_key()` prepended the `custom:` prefix again, producing a `custom:custom` key in `auth.json` instead of `custom`. Hermes pool lookups expect `{provider}:{name}` keys where the provider namespace is `custom` — a `custom:custom` key is either invisible to lookup or treated as a distinct bogus provider.
 
 **Root cause**: `_hermes_pool_key()` added `custom:` for every provider not in `STANDARD_PROVIDERS`. Since `custom` itself is not in the standard set, a provider already normalized to `custom` got double-prefixed.
 
-**Fix** (v7.13.1): `_hermes_pool_key()` returns `custom` directly when `pk == HERMES_CUSTOM_PROVIDER` before the standard-provider check. Non-standard providers other than `custom` still get the `custom:` prefix as before.
+**Fix** (v7.13.2): `_hermes_pool_key()` returns `custom` directly when `pk == HERMES_CUSTOM_PROVIDER` before the standard-provider check. Non-standard providers other than `custom` still get the `custom:` prefix as before.
 
 ```python
 def _hermes_pool_key(provider):
@@ -414,11 +414,11 @@ credential-pool-sync/
 
 ## Version history
 
-### v7.13.1 (2026-08-07)
+### v7.13.2 (2026-08-07)
 
 - **Fixed `custom:custom` credential pool key**: `_hermes_pool_key()` previously produced `custom:custom` for the `custom` provider (the `custom:` prefix was prepended to a provider that was already "custom"). Now it returns bare `custom` directly when `pk == HERMES_CUSTOM_PROVIDER`. Prior to this, Hermes could show a `custom:custom` key in `auth.json`.
-- **Added version header to `auto_bootstrap.py`**: Docstring now carries the `v7.13.1` version, matching the other scripts.
-- **Bumped version strings** to `v7.13.1` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, and `SKILL.md`.
+- **Added version header to `auto_bootstrap.py`**: Docstring now carries the `v7.13.2` version, matching the other scripts.
+- **Bumped version strings** to `v7.13.2` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, and `SKILL.md`.
 
 ### v7.13.0 (2026-08-06)
 

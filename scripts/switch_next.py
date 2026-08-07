@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.13.1 — 含飞书状态管理优化 + Provider 反推修复"""
+"""切换到下一个可用凭证 v7.13.2 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 

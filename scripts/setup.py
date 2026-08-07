@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-凭证池技能一键部署脚本 v7.13.1
+凭证池技能一键部署脚本 v7.13.2
 
 在任何安装了本技能的 Hermes 机器上运行一次，即可完成全部配置：
   1. 检查飞书凭证是否可用
@@ -260,7 +260,7 @@ def main():
     skip_bootstrap = args.skip_bootstrap or args.sync_only
 
     print("=" * 60)
-    print("🔧 凭证池技能一键部署 v7.13.1")
+    print("🔧 凭证池技能一键部署 v7.13.2")
     print("=" * 60)
     print(f"技能目录: {SKILL_DIR}")
     print(f"Hermes 配置: {get_config_path()}")
