@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.13.2 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
+"""凭证池同步脚本 v7.14.0 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -222,7 +222,13 @@ def endpoint_candidates(base_url):
     can use Coding-Plan's response to classify Agent-Plan (or vice versa).
     """
     base = _strip_endpoint_suffix(base_url)
-    return [f"{base}/chat/completions", f"{base}/messages"]
+    candidates = [f"{base}/chat/completions", f"{base}/messages"]
+    # MiniMax and similar providers use /anthropic path which 404s on both
+    # /chat/completions and /messages; add /v1/chat/completions as fallback
+    if base.lower().endswith("/anthropic"):
+        root = base[:-len("/anthropic")].rstrip("/")
+        candidates.append(f"{root}/v1/chat/completions")
+    return candidates
 
 
 def _strip_endpoint_suffix(value):
@@ -256,6 +262,8 @@ def detect_provider(base_url):
         ("api.deepseek.com", "DEEPSEEK"),
         ("api.moonshot.cn", "MOONSHOT"),
         ("dashscope.aliyuncs.com", "DASHSCOPE"),
+        ("api.minimaxi.com", "MINIMAX"),
+        ("xiaomimimo.com", "XIAOMI"),
     )
     for marker, provider in mapping:
         if marker in host:
@@ -342,16 +350,12 @@ def tk(p, ak, bu, m):
                     continue
                 return False, S_I, "Key 无效", endpoint.rstrip("/")
             if exc.code == 404:
-                # A 404 on a model route proves neither that the API key is
-                # invalid nor that the credential itself is unusable.  ARK
-                # returns this for a model outside the account's entitlement
-                # and for an unavailable endpoint/model combination.
-                return (
-                    False,
-                    S_U,
-                    "HTTP 404: model or account entitlement unavailable",
-                    endpoint.rstrip("/"),
-                )
+                # A 404 means the endpoint path does not exist. Try the next
+                # candidate endpoint instead of immediately marking the
+                # credential as S_U. If all candidates 404, the final return
+                # at the end of the loop will report S_U with the last error.
+                last_error = "HTTP 404"
+                continue
             if exc.code == 405:
                 last_error = "HTTP 405"
                 continue
@@ -910,7 +914,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.13.2"); print("="*50)
+    print("="*50); print("凭证池同步 v7.14.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []
