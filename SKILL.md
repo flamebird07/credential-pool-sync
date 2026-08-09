@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.13.2 fixes the custom:custom credential pool key."
-version: 7.13.1
+version: 7.13.2
 author: Hermes Agent
 platforms: [windows]
 metadata:
