@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.13.2 fixes the custom:custom credential pool key."
-version: 7.14.0
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.14.1 fixes the custom:custom credential pool key."
+version: 7.14.1
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -217,13 +217,13 @@ To repair existing Feishu records with empty or stale Provider fields:
 python scripts/cleanup_feishu_status.py --repair-provider
 ```
 
-### Pitfall: `custom:custom` credential pool key (v7.13.2)
+### Pitfall: `custom:custom` credential pool key (v7.14.1)
 
 **Problem**: When a record's provider is already the bare `custom` value, `_hermes_pool_key()` prepended the `custom:` prefix again, producing a `custom:custom` key in `auth.json` instead of `custom`. Hermes pool lookups expect `{provider}:{name}` keys where the provider namespace is `custom` — a `custom:custom` key is either invisible to lookup or treated as a distinct bogus provider.
 
 **Root cause**: `_hermes_pool_key()` added `custom:` for every provider not in `STANDARD_PROVIDERS`. Since `custom` itself is not in the standard set, a provider already normalized to `custom` got double-prefixed.
 
-**Fix** (v7.13.2): `_hermes_pool_key()` returns `custom` directly when `pk == HERMES_CUSTOM_PROVIDER` before the standard-provider check. Non-standard providers other than `custom` still get the `custom:` prefix as before.
+**Fix** (v7.14.1): `_hermes_pool_key()` returns `custom` directly when `pk == HERMES_CUSTOM_PROVIDER` before the standard-provider check. Non-standard providers other than `custom` still get the `custom:` prefix as before.
 
 ```python
 def _hermes_pool_key(provider):
@@ -414,11 +414,16 @@ credential-pool-sync/
 
 ## Version history
 
-### v7.13.2 (2026-08-07)
+### v7.14.1 (2026-08-10)
+
+- **Fixed `register_cron_job()` script path sandbox violation**: `setup.py` previously registered the cron job with an absolute path pointing into the skills directory (`SCRIPT_DIR/sync_credential_pool.py`), which the cron sandbox rejected with "Blocked: script path resolves outside the scripts directory". Now copies the script to `~/AppData/Local/hermes/scripts/credential_pool_sync.py` via `shutil.copy2` and uses the relative filename. Also sets `workdir` to the scripts directory. Existing jobs are migrated on re-run.
+- **Added `get_cron_scripts_dir()` helper**: Returns the canonical `~/AppData/Local/hermes/scripts` path for cron-compatible script placement.
+
+### v7.14.1 (2026-08-07)
 
 - **Fixed `custom:custom` credential pool key**: `_hermes_pool_key()` previously produced `custom:custom` for the `custom` provider (the `custom:` prefix was prepended to a provider that was already "custom"). Now it returns bare `custom` directly when `pk == HERMES_CUSTOM_PROVIDER`. Prior to this, Hermes could show a `custom:custom` key in `auth.json`.
-- **Added version header to `auto_bootstrap.py`**: Docstring now carries the `v7.13.2` version, matching the other scripts.
-- **Bumped version strings** to `v7.13.2` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, and `SKILL.md`.
+- **Added version header to `auto_bootstrap.py`**: Docstring now carries the `v7.14.1` version, matching the other scripts.
+- **Bumped version strings** to `v7.14.1` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, and `SKILL.md`.
 
 ### v7.13.0 (2026-08-06)
 

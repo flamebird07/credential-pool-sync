@@ -21,6 +21,7 @@
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
 import uuid
@@ -52,6 +53,11 @@ def get_auth_path():
 
 def get_cron_jobs_path():
     return get_hermes_home() / "cron" / "jobs.json"
+
+
+def get_cron_scripts_dir():
+    """cron job 脚本的稳定存放目录（不随技能目录移动）。"""
+    return get_hermes_home() / "scripts"
 
 
 def load_config():
@@ -137,7 +143,13 @@ CRON_SCHEDULE = "0 */2 * * *"  # 每 2 小时
 
 
 def register_cron_job():
-    """注册定时同步 cron job。幂等：已存在同名则跳过。返回 (done, message)。"""
+    """
+    注册定时同步 cron job。幂等：已存在同名则更新其 script/workdir 路径后写入。
+
+    脚本会先复制到 hermes/scripts/credential_pool_sync.py（稳定位置，不随技能目录移动），
+    cron job 的 script 字段用相对文件名，避免旧版绝对路径指向已迁移的技能目录导致失效。
+    返回 (done, message)。
+    """
     jobs_path = get_cron_jobs_path()
     if not jobs_path.parent.exists():
         jobs_path.parent.mkdir(parents=True, exist_ok=True)
@@ -151,12 +163,27 @@ def register_cron_job():
     else:
         data = {"jobs": []}
 
+    # 1. 把同步脚本复制到稳定位置
+    sync_src = SCRIPT_DIR / "sync_credential_pool.py"
+    cron_scripts_dir = get_cron_scripts_dir()
+    cron_scripts_dir.mkdir(parents=True, exist_ok=True)
+    sync_dst = cron_scripts_dir / "credential_pool_sync.py"
+    shutil.copy2(sync_src, sync_dst)
+
     jobs = data.get("jobs", [])
+    found = None
     for job in jobs:
         if job.get("name") == CRON_JOB_NAME:
-            return False, f"已存在同名 cron job（{job.get('schedule_display','?')}），跳过"
+            found = job
+            break
 
-    sync_script = SCRIPT_DIR / "sync_credential_pool.py"
+    if found is not None:
+        # 2. 修复旧版绝对路径 bug：更新 script 为相对文件名 + workdir 为稳定目录
+        found["script"] = sync_dst.name
+        found["workdir"] = str(cron_scripts_dir)
+        data["jobs"] = jobs
+        _write_jobs_json(data, jobs_path)
+        return False, f"已存在同名 cron job，已更新 script 路径为 {sync_dst.name}（workdir={cron_scripts_dir.name}）"
 
     new_job = {
         "id": uuid.uuid4().hex[:12],
@@ -167,7 +194,7 @@ def register_cron_job():
         "model": None,
         "provider": None,
         "base_url": None,
-        "script": str(sync_script),
+        "script": sync_dst.name,
         "no_agent": True,
         "context_from": None,
         "schedule": {
@@ -190,14 +217,20 @@ def register_cron_job():
         "deliver": "local",
         "origin": None,
         "enabled_toolsets": None,
-        "workdir": str(SCRIPT_DIR),
+        "workdir": str(cron_scripts_dir),
         "profile": None,
         "fire_claim": None,
     }
 
     jobs.append(new_job)
     data["jobs"] = jobs
+    _write_jobs_json(data, jobs_path)
 
+    return True, f"已注册 cron job：{CRON_SCHEDULE}（每2小时同步一次，静默运行不推送）"
+
+
+def _write_jobs_json(data, jobs_path):
+    """原子写入 jobs.json。"""
     tmp = jobs_path.with_suffix(f".json.{uuid.uuid4().hex}.tmp")
     try:
         with open(tmp, "w", encoding="utf-8") as f:
@@ -208,8 +241,6 @@ def register_cron_job():
     finally:
         if tmp.exists():
             tmp.unlink()
-
-    return True, f"已注册 cron job：{CRON_SCHEDULE}（每2小时同步一次，静默运行不推送）"
 
 
 # ─── Step 4: 配置 gateway startup hook ────────────────────────────
