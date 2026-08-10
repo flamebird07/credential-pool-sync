@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.14.0 — 含飞书状态管理优化 + Provider 反推修复"""
+"""切换到下一个可用凭证 v7.14.2 — 含飞书状态管理优化 + Provider 反推修复"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 
@@ -246,7 +246,17 @@ def first_healthy(records, current, token=None):
             if record_id:
                 us(token, record_id, new_status, note=(note or None))
 
-    for record in ordered_candidates(active_valid, current):
+    candidates = ordered_candidates(active_valid, current)
+    # 当候选列表为空但当前凭证仍有效时，说明当前已是最优，返回 noop 标记
+    if not candidates and current_identity is not None and any(
+        identity(r) == current_identity for r in active_valid
+    ):
+        target = dict(current or {})
+        target["noop"] = True
+        target["record_id"] = None
+        return target
+
+    for record in candidates:
         if not record.get("api_key") or not record.get("base_url"):
             continue
         is_valid, status, error, _used_url = tk(
@@ -322,6 +332,9 @@ def main():
         rotation_lock = Path(__file__).with_name(".rotation")
         records = read_auth_records() if args.skip_sync else run_sync(full=True)
         target, path = rotate_once(records, rotation_lock)
+        if target is not None and target.get("noop"):
+            print("当前已是最优凭证，无需切换")
+            return 0
         if target is None:
             print("没有可用候选，执行完整同步后再试一次...")
             records = run_sync(full=True)
