@@ -1,118 +1,73 @@
-# 凭证池同步工具 (Credential Pool Sync)
+# 凭证池同步工具
 
-将飞书多维表格中的 API Key 自动同步到 Hermes 凭证池，支持连通性验证、状态回写和定时同步。
-
-## 适用场景
-
-- 多台机器共享同一套 API Key 配置
-- 通过飞书表格集中管理 API Key（增/改/删）
-- 自动检测无效或限流的 Key
+将飞书多维表格中的 API 凭证同步到 Hermes `auth.json`；支持健康检查、优先级分层、故障切换和飞书状态回写。
 
 ## 前置条件
 
-| 条件 | 说明 |
-|------|------|
-| Hermes Agent | v0.144+（凭证池功能） |
-| Python | 3.10+ |
-| 飞书访问权限 | 凭证池子表的阅读+写入权限 |
+- Windows 上的 Hermes Agent 和 Python 3.10+。
+- 飞书应用对目标多维表格具有读写权限。
+- Hermes `config.yaml` 中已配置飞书应用凭证，或提供 `FEISHU_APP_ID`、`FEISHU_APP_SECRET`。
 
-## 安装
+## 配置
 
-### 1. 克隆仓库
-
-```bash
-git clone https://github.com/flamebird07/credential-pool-sync.git
-cd credential-pool-sync
-```
-
-### 2. 配置飞书环境变量
-
-```bash
-cp .env.example ~/.hermes/.env
-# 编辑 ~/.hermes/.env，填入真实值
-chmod 600 ~/.hermes/.env
-```
-
-飞书应用需要具备以下权限：
-- bitable:app（多维表格）
-- 凭证池子表的读取和写入权限
-
-### 3. 配置 Hermes
-
-在 Hermes config.yaml 的 custom_providers 中注册 Provider：
+凭证和飞书表格位置都不写入仓库。优先使用环境变量；也可写入本机 `%LOCALAPPDATA%\hermes\config.yaml`：
 
 ```yaml
-custom_providers:
-  - name: ARK
-    base_url: https://ark.cn-beijing.volces.com/api/plan/v3
-  - name: longcat
-    base_url: https://api.longcat.chat/anthropic
-  - name: xiaomi
-    base_url: https://api.xiaomimimo.com/anthropic
-  - name: Z.AI
-    base_url: https://open.bigmodel.cn/api/paas/v4
+credential_pool_sync:
+  bitable_app_token: <飞书多维表格 App Token>
+  bitable_table_id: <凭证表 Table ID>
 ```
 
-Provider 的 name 必须与飞书表格中的 Provider 字段值大小写完全一致。
+对应的环境变量为：
+
+```powershell
+$env:FEISHU_APP_ID = "..."
+$env:FEISHU_APP_SECRET = "..."
+$env:FEISHU_BITABLE_APP_TOKEN = "..."
+$env:FEISHU_BITABLE_TABLE_ID = "..."
+```
+
+飞书表至少需要以下字段：`Provider`、`Label`、`API Key`、`Base URL`、`模型`、`优先级`、`状态`、`备注`。优先级为 0–9，0 最高；同步只加载第一个拥有健康凭证的优先级档位。
 
 ## 使用
 
-### 手动同步
+```powershell
+# 一次性部署：首次同步、每两小时定时任务、Gateway 启动钩子
+python scripts/setup.py
 
-```bash
-cd credential-pool-sync
+# 完整同步（健康检查、auth.json、飞书状态回写）
 python scripts/sync_credential_pool.py
+
+# 快速同步（不做健康检查和飞书回写）
+python scripts/sync_credential_pool.py --skip-health-rotate
+
+# 切换到下一个健康凭证
+python scripts/switch_next.py
+
+# 修复飞书状态或 Provider 展示字段
+python scripts/cleanup_feishu_status.py
+python scripts/cleanup_feishu_status.py --repair-provider
 ```
 
-### 定时自动同步
+## 安全与运行规则
 
-```bash
-hermes cron create credential-pool-sync --schedule "*/30 * * * *" --script cron_sync.sh --no-agent --deliver origin
-```
-
-## 飞书表格结构
-
-| 字段名 | 类型 | 说明 | 必填 |
-|--------|------|------|:----:|
-| Provider | 文本 | Provider 名称 | ✅ |
-| Label | 文本 | 显示标签 | |
-| API Key | 文本 | API 密钥原文 | ✅ |
-| Base URL | 文本 | API 端点地址 | ✅ |
-| 优先级 | 数字 | 优先级（0=最高） | |
-
-优先级数值越小，凭证同步顺序越靠前；未填写或无法解析时按 999 处理。同一 Provider 和 Label 的重复记录仅保留优先级最高（数值最小）的一条，优先级相同时保留飞书原始顺序最靠前的一条。
-
-## 安全性说明
-
-| 风险 | 缓解措施 |
-|------|----------|
-| API Key 明文存储在飞书表格 | 确保飞书表格的访问权限最小化 |
-| 飞书 App Secret 存储在 ~/.hermes/.env | 文件权限设为 600 |
-| 脚本硬编码 Base Token | 如需更换飞书表格需修改脚本 |
-| 凭证传输到 Hermes | 通过 hermes auth add CLI 添加 |
-
-## 故障排除
-
-| 问题 | 原因 | 解决 |
-|------|------|------|
-| hermes auth list 看不到新增的 Provider | Hermes 未自动发现 | 检查 config.yaml custom_providers |
-| 同步脚本报 401 | 飞书 App Secret 错误 | 检查 ~/.hermes/.env |
-| 同步脚本报 429 | API Key 已限流 | 飞书表格状态会更新 |
-| Cron job 不执行 | Gateway 未运行 | 运行 hermes gateway run |
-| Provider Key 不匹配 | 大小写不一致 | 确保与 config.yaml 完全一致 |
+- API Key 和飞书应用密钥只保存在飞书、本机环境变量或 Hermes 本机配置中；不要提交 `.env`、`config.yaml` 或 `auth.json`。
+- `Provider` 的 URL 反推仅用于飞书展示；非内置 Hermes Provider 在 `auth.json` 和 `config.yaml` 中一律使用 `custom`。
+- 活跃凭证身份由 `(model, api_key, base_url)` 决定，模型和 URL 会规范化后比较。
+- `auth.json` 使用原子写入；当健康检查出现大面积不可用时，完整性保护会保留现有池。
 
 ## 项目结构
 
 ```
 credential-pool-sync/
+├── SKILL.md
 ├── scripts/
 │   ├── sync_credential_pool.py
-│   └── cron_sync.sh
-├── .env.example
-├── README.md
-└── .gitignore
+│   ├── switch_next.py
+│   ├── auto_bootstrap.py
+│   ├── cleanup_feishu_status.py
+│   └── setup.py
+└── references/
 ```
 
-## 许可证
-
-MIT
+当前版本：v7.15.0。

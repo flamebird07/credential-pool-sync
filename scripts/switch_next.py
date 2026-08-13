@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.14.2 — 含飞书状态管理优化 + Provider 反推修复"""
+"""切换到下一个可用凭证 v7.15.0。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 
@@ -23,11 +23,9 @@ from sync_credential_pool import (
     priority,
     group_by_priority,
     collect_active_tier,
+    load_bitable_ids,
     identity as pool_identity,
 )
-
-BASE_TOKEN = "YedtbFYKZatu2QsGti9ch7xbnGc"
-TABLE_ID = "tblOSK9HexYVOHBW"
 
 def get_hermes_home():
     """Return the single Hermes data directory used by both scripts."""
@@ -101,10 +99,11 @@ def gt():
     return result["tenant_access_token"]
 
 def gr(t):
+    base_token, table_id = load_bitable_ids()
     h = {"Authorization": f"Bearer {t}"}
     a, pt = [], ""
     while True:
-        u = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records?page_size=100" + (f"&page_token={pt}" if pt else "")
+        u = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records?page_size=100" + (f"&page_token={pt}" if pt else "")
         r = request_with_retry(urllib.request.Request(u, headers=h), timeout=15)
         a.extend(r["data"]["items"]); pt = r["data"].get("page_token", "")
         if not r["data"].get("has_more"): break
@@ -126,6 +125,7 @@ def request_with_retry(req, timeout=8, max_retries=2):
             time.sleep(2 ** i * (0.5 + random.random() * 0.5))
 
 def us(t, rid, s=None, note=None):
+    base_token, table_id = load_bitable_ids()
     h = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
     f = {}
     if s is not None:
@@ -135,7 +135,7 @@ def us(t, rid, s=None, note=None):
 
     if not f:
         return
-    request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
+    request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
 
 _UNSET = object()
 

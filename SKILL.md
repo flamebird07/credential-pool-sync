@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. v7.13.0 adds priority tier-based reading: 0-9 tiers, read only lowest tier with valid credentials. v7.14.0 fixes the custom:custom credential pool key. v7.14.2 fixes switch_next.py false-failure when current credential is already optimal."
-version: 7.14.2
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. Read only the highest priority tier (0–9) that has valid credentials, maintain per-agent Feishu status, and safely update Hermes auth/config files."
+version: 7.15.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,13 +10,15 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.14.2
+# Credential Pool Sync v7.15.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
 `%LOCALAPPDATA%\hermes\skills\devops\credential-pool-sync`
 
 The external `credential-pool-sync` repository is the development source only. Runtime scripts live in this skill's own `scripts/` directory, so the installed skill is standalone.
+
+Feishu application credentials and Bitable identifiers must not be embedded in source. Read `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_BITABLE_APP_TOKEN`, and `FEISHU_BITABLE_TABLE_ID` from the environment, or place them in the local Hermes `config.yaml` under `credential_pool_sync`.
 
 ## Four-Step Method Execution
 
@@ -176,7 +178,7 @@ Alternatively configure `secrets.feishu.app_id` and `secrets.feishu.app_secret` 
 
 ## Cleanup semantics
 
-`cleanup_feishu_status.py` reads the active model from Hermes `config.yaml` and compares the identity. **Note**: as of v7.6.0, `switch_next.py` uses `(model, api_key)` for identity but `cleanup_feishu_status.py` still uses the old `(api_key, base_url, model)` format - see "Pitfall: Identity inconsistency across scripts" above. A healthy active credential receives this agent's in-use marker in the status field (via `status_add()`). Other healthy credentials are marked `✅ 正常`, or retain another agent's in-use marker via `status_remove()`. Unhealthy records lose only this agent's marker and receive the health result. It never marks every healthy credential as in-use.
+`cleanup_feishu_status.py` reads the active model from Hermes `config.yaml` and compares the normalized `(model, api_key, base_url)` identity. A healthy active credential receives this agent's in-use marker in the status field (via `status_add()`). Other healthy credentials are marked `✅ 正常`, or retain another agent's in-use marker via `status_remove()`. Unhealthy records lose only this agent's marker and receive the health result. It never marks every healthy credential as in-use.
 
 ## Provider Reverse-Inference (Feishu display only — do NOT leak into Hermes config)
 
@@ -413,6 +415,11 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.15.0 (2026-08-13)
+- Removed repository-embedded Feishu Bitable identifiers; load them from environment variables or local Hermes configuration instead.
+- Removed obsolete note-field usage helpers that were no longer called.
+- Reconciled README and operational documentation with the actual priority-tier and provider behavior.
 
 ### v7.14.2 (2026-08-10)
 

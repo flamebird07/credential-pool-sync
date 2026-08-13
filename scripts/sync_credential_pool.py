@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.14.2 — 含连通性验证 + 状态回写 + 429自动切换 + 飞书状态管理优化 + Provider 反推修复"""
+"""凭证池同步脚本 v7.15.0 — 含连通性验证、状态回写和安全配置加载。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -39,8 +39,6 @@ def request_with_retry(req, timeout=8, max_retries=2):
                 raise
             time.sleep(2 ** i * (0.5 + random.random() * 0.5))
 
-BASE_TOKEN = "YedtbFYKZatu2QsGti9ch7xbnGc"
-TABLE_ID = "tblOSK9HexYVOHBW"
 def get_hermes_home():
     """Return the single Hermes data directory used by both scripts."""
     return Path.home() / "AppData" / "Local" / "hermes"
@@ -78,6 +76,44 @@ def load_feishu_credentials():
         "Feishu credentials are not configured. Set FEISHU_APP_ID and FEISHU_APP_SECRET, "
         "or configure secrets.feishu.app_id and secrets.feishu.app_secret in Hermes config.yaml."
     )
+
+
+def load_bitable_ids():
+    """Load the Feishu Bitable app token and table ID without embedding them in source.
+
+    Environment variables take precedence.  Hermes config supports the same
+    values under ``credential_pool_sync`` or any existing Feishu mapping so
+    scheduled jobs work without inheriting an interactive shell environment.
+    """
+    app_token = os.environ.get("FEISHU_BITABLE_APP_TOKEN", "").strip()
+    table_id = os.environ.get("FEISHU_BITABLE_TABLE_ID", "").strip()
+    try:
+        config = yaml.safe_load(get_runtime_config_path().read_text(encoding="utf-8")) or {}
+        feishu_mappings = [
+            config.get("credential_pool_sync"),
+            config.get("feishu"),
+            (config.get("secrets") or {}).get("feishu") if isinstance(config.get("secrets"), dict) else None,
+            (config.get("channels") or {}).get("feishu") if isinstance(config.get("channels"), dict) else None,
+            ((config.get("platforms") or {}).get("feishu") or {}).get("extra") if isinstance(config.get("platforms"), dict) else None,
+        ]
+        for mapping in feishu_mappings:
+            if not isinstance(mapping, dict):
+                continue
+            app_token = app_token or str(
+                mapping.get("bitable_app_token") or mapping.get("app_token") or mapping.get("base_token") or ""
+            ).strip()
+            table_id = table_id or str(
+                mapping.get("bitable_table_id") or mapping.get("table_id") or ""
+            ).strip()
+    except (OSError, UnicodeError, yaml.YAMLError):
+        pass
+    if not app_token or not table_id:
+        raise RuntimeError(
+            "Feishu Bitable location is not configured. Set FEISHU_BITABLE_APP_TOKEN and "
+            "FEISHU_BITABLE_TABLE_ID, or configure credential_pool_sync.bitable_app_token "
+            "and credential_pool_sync.bitable_table_id in Hermes config.yaml."
+        )
+    return app_token, table_id
 
 S_U = "⚠️ 不可用"
 S_A = "✅ 正常"
@@ -151,33 +187,6 @@ def health_status(is_valid, status, error=None):
         return S_I
     return S_U
 
-def _usage_names(note):
-    match = re.search(r"🔄\s+(.+?)使用中", str(note or ""))
-    return match.group(1).split("+") if match else []
-
-def usage_remove(note, name):
-    names = [agent for agent in _usage_names(note) if agent != name]
-    # 移除现有的使用信息标记
-    detail = re.sub(r"\s*\|\s*🔄\s+.+?使用中", "", str(note or "")).strip(" |")
-    # 重新构建备注，移除空字符串
-    parts = [p.strip() for p in detail.split("|") if p.strip()]
-    if names:
-        return f"{' | '.join(parts)} | 🔄 {'+'.join(names)}使用中"
-    else:
-        return " | ".join(parts) if parts else ""
-
-def usage_add(note, name):
-    names = [agent for agent in _usage_names(note) if agent != name] + [name]
-    # 移除现有的使用信息标记
-    detail = re.sub(r"\s*\|\s*🔄\s+.+?使用中", "", str(note or "")).strip(" |")
-    # 重新构建备注，移除空字符串
-    parts = [p.strip() for p in detail.split("|") if p.strip()]
-    marker = f"🔄 {'+'.join(dict.fromkeys(names))}使用中"
-    if parts:
-        return f"{' | '.join(parts)} | {marker}"
-    else:
-        return marker
-
 def gt():
     app_id, app_secret = load_feishu_credentials()
     d = json.dumps({"app_id": app_id, "app_secret": app_secret}).encode()
@@ -188,9 +197,10 @@ def gt():
     return result["tenant_access_token"]
 
 def gr(t):
+    base_token, table_id = load_bitable_ids()
     h = {"Authorization": f"Bearer {t}"}; a, pt = [], ""
     while True:
-        u = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records?page_size=100" + (f"&page_token={pt}" if pt else "")
+        u = f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records?page_size=100" + (f"&page_token={pt}" if pt else "")
         r = request_with_retry(urllib.request.Request(u, headers=h), timeout=15)
         a.extend(r["data"]["items"]); pt = r["data"].get("page_token", "")
         if not r["data"].get("has_more"): break
@@ -199,6 +209,7 @@ def gr(t):
 _UNSET = object()
 
 def us(t, rid, s=None, note=None, provider=None, base_url=None):
+    base_token, table_id = load_bitable_ids()
     h = {"Authorization": f"Bearer {t}", "Content-Type": "application/json"}
     f = {}
     if s is not None:
@@ -212,7 +223,7 @@ def us(t, rid, s=None, note=None, provider=None, base_url=None):
         f["Base URL"] = base_url
     if not f:
         return
-    request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{BASE_TOKEN}/tables/{TABLE_ID}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
+    request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
 
 def endpoint_candidates(base_url):
     """Return protocol paths for exactly one configured credential route.
@@ -914,7 +925,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.14.2"); print("="*50)
+    print("="*50); print("凭证池同步 v7.15.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []
