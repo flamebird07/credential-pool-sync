@@ -70,4 +70,14 @@ credential-pool-sync/
 └── references/
 ```
 
-当前版本：v7.15.0。
+## 新机器首次部署
+
+首次执行 `python scripts/setup.py` 会检查飞书机器人能否读取、写入、建表和新增字段。给它一个已有的空白或成熟多维表格：
+
+```powershell
+python scripts/setup.py --bitable-app-token app_xxx
+```
+
+若该多维表格没有名为 `凭证池` 的数据表，技能会新建该表并补齐标准字段。它会在飞书中提示用户填写 API Key、Base URL 和模型；只有至少一条凭证通过健康检查后，才会启用定时同步和 Gateway 启动钩子。权限、表格或有效凭证不满足时，部署以未激活状态退出，不会让 Hermes 因空凭证池进入自动运转。
+
+当前版本：v7.16.0。

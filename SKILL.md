@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. Read only the highest priority tier (0–9) that has valid credentials, maintain per-agent Feishu status, and safely update Hermes auth/config files."
-version: 7.15.0
+description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. On a new machine, guide setup through Feishu permission and table-schema checks, and do not activate cron/startup automation until at least one credential passes health checks."
+version: 7.16.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.15.0
+# Credential Pool Sync v7.16.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -40,11 +40,13 @@ cd %LOCALAPPDATA%\hermes\skills\devops\credential-pool-sync
 python scripts/setup.py
 ```
 
-This automatically does:
-1. Checks Feishu credentials are present in config.yaml or environment variables
-2. Runs a full first sync (health check + auth.json + fallback_providers + switch to a healthy model)
-3. Registers a cron job to sync every 2 hours (`0 */2 * * *`, silent delivery)
-4. Configures gateway startup hooks to auto-run `auto_bootstrap.py` on gateway restart
+This guided setup automatically does:
+1. Checks Feishu robot credentials and access to the user-provided Bitable.
+2. Reuses a `凭证池` table or creates one in an empty Bitable, then adds every required field that is missing.
+3. Runs a full first sync and requires at least one health-checked credential.
+4. Only after that gate succeeds, registers a cron job every 2 hours (`0 */2 * * *`) and configures the Gateway startup hook.
+
+If the table, required permissions, or a healthy credential is missing, setup exits without enabling either automation. Give the App Token with `--bitable-app-token app_xxx` (and, if needed, `--bitable-table-id tbl_xxx`), or configure the corresponding environment variables/local Hermes configuration. The user must grant the Feishu bot access to the supplied Bitable; this skill never creates a top-level document without a user-controlled folder.
 
 Additional options:
 - `--skip-cron` - Skip registering the cron job
@@ -415,6 +417,10 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.16.0 (2026-08-13)
+- Added first-install provisioning: explicit Feishu Bitable access check, standard credential-table creation/repair, and interactive/non-interactive App Token guidance.
+- Made the first successful health check an activation gate; cron and Gateway startup automation remain disabled until at least one valid credential exists.
 
 ### v7.15.0 (2026-08-13)
 - Removed repository-embedded Feishu Bitable identifiers; load them from environment variables or local Hermes configuration instead.
