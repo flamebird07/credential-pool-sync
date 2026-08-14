@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.16.0 — 含连通性验证、状态回写和安全配置加载。"""
+"""凭证池同步脚本 v7.17.0 — 含连通性验证、状态回写和安全配置加载。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -236,18 +236,18 @@ def endpoint_candidates(base_url):
     candidates = [f"{base}/chat/completions", f"{base}/messages"]
     # MiniMax and similar providers use /anthropic path which 404s on both
     # /chat/completions and /messages; add /v1/chat/completions as fallback
-    if base.lower().endswith("/anthropic"):
+    base_l = base.lower()
+    if base_l.endswith("/anthropic"):
         root = base[:-len("/anthropic")].rstrip("/")
         candidates.append(f"{root}/v1/chat/completions")
+    elif not re.search(r"/v\d+$", base_l):
+        candidates.append(f"{base}/v1/chat/completions")
     return candidates
 
 
 def _strip_endpoint_suffix(value):
     value = str(value or "").strip().rstrip("/")
-    for suffix in (
-        "/v1/chat/completions", "/v3/chat/completions", "/chat/completions",
-        "/v1/messages", "/v3/messages", "/messages",
-    ):
+    for suffix in ("/chat/completions", "/messages"):
         if value.lower().endswith(suffix):
             return value[:-len(suffix)].rstrip("/")
     return value
@@ -274,6 +274,7 @@ def detect_provider(base_url):
         ("api.moonshot.cn", "MOONSHOT"),
         ("dashscope.aliyuncs.com", "DASHSCOPE"),
         ("api.minimaxi.com", "MINIMAX"),
+        ("api.minimax.chat", "MINIMAX"),
         ("xiaomimimo.com", "XIAOMI"),
     )
     for marker, provider in mapping:
@@ -288,11 +289,19 @@ def try_url_variants(base_url):
     Endpoint healing is intentionally not performed during health checks:
     changing ``api/plan`` into ``api/coding`` makes status attribution
     unreliable.  Route corrections must be made explicitly in Feishu.
+
+    When the stored base has no explicit version segment (``/v1``, ``/v3``,
+    ...), also probe a ``/v1``-prefixed variant: many providers only serve
+    their API under a versioned path.
     """
     base = _strip_endpoint_suffix(base_url)
     if not base:
         return []
-    return [base]
+    variants = [base]
+    # 匹配任意版本段（/v1、/v3、/v2/...），不只限定 1 和 3
+    if not re.search(r"/v\d+(?:/|$)", base.lower()):
+        variants.append(f"{base}/v1")
+    return variants
 
 
 def model_limits(model_name):
@@ -371,7 +380,11 @@ def tk(p, ak, bu, m):
                 last_error = "HTTP 405"
                 continue
             if 400 <= exc.code < 500:
-                return False, S_U, f"HTTP {exc.code}", endpoint.rstrip("/")
+                # 这些 4xx 可能是端点/版本不匹配（如命中 /v3 而服务端只提供
+                # /v1，或 plan 后缀错误），记录错误并继续尝试后续候选端点，
+                # 而不是立即把凭据标记为 S_U。
+                last_error = f"HTTP {exc.code}"
+                continue
             return False, S_U, f"HTTP {exc.code}: 服务暂不可用", endpoint.rstrip("/")
         except (urllib.error.URLError, OSError) as exc:
             last_error = f"连接失败: {str(exc)[:80]}"
@@ -925,7 +938,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.16.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.17.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []

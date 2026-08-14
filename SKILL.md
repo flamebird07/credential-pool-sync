@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
-description: "Synchronize, health-check, rotate, and reconcile Hermes credentials stored in Feishu Bitable. On a new machine, guide setup through Feishu permission and table-schema checks, and do not activate cron/startup automation until at least one credential passes health checks."
-version: 7.16.0
+description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
+version: 7.17.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,13 +10,25 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.16.0
+# Credential Pool Sync v7.17.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
 `%LOCALAPPDATA%\hermes\skills\devops\credential-pool-sync`
 
 The external `credential-pool-sync` repository is the development source only. Runtime scripts live in this skill's own `scripts/` directory, so the installed skill is standalone.
+
+## Claude Code 独立凭证池
+
+当用户说“启用 Claude 凭证池”时，执行：
+
+```powershell
+python scripts/enable_claude_credential_pool.py
+```
+
+脚本复用 Hermes 已配置的飞书机器人和多维表格文档，新建或复用独立的 `Claude Code 凭证池` 数据表。该表字段与主凭证池一致，但凭证、状态和轮换完全独立。它会更新 Claude Code 设置，并注册 Windows 登录后后台启动的本地代理。代理遇到额度不足、余额不足或 429 限流，会换用下一条 Claude 专用凭证并重试同一请求。
+
+首次启用后，Hermes 与 OpenCode 四步法调用同一台机器上的 Claude Code CLI，无需重复配置。不要把 Claude 专用表的记录写回 Hermes `auth.json` 或主凭证池表。
 
 Feishu application credentials and Bitable identifiers must not be embedded in source. Read `FEISHU_APP_ID`, `FEISHU_APP_SECRET`, `FEISHU_BITABLE_APP_TOKEN`, and `FEISHU_BITABLE_TABLE_ID` from the environment, or place them in the local Hermes `config.yaml` under `credential_pool_sync`.
 
@@ -418,13 +430,16 @@ credential-pool-sync/
 
 ## Version history
 
-### v7.16.0 (2026-08-13)
-- Added first-install provisioning: explicit Feishu Bitable access check, standard credential-table creation/repair, and interactive/non-interactive App Token guidance.
-- Made the first successful health check an activation gate; cron and Gateway startup automation remain disabled until at least one valid credential exists.
+### v7.17.0 (2026-08-14)
+- **Fixed MiniMax/DeepSeek health check false failures (S_U)**:
+  1. Removed `/anthropic` gate in `endpoint_candidates()`; now `/v1/chat/completions` is added for *any* base URL without a version segment.
+  2. Changed `_strip_endpoint_suffix()` to only strip method suffixes (`/chat/completions`, `/messages`), preserving version prefixes like `/v1`, `/v3`.
+  3. Fixed `tk()`: 400-499 errors (400/406/422/...) now `continue` to try other candidate endpoints instead of returning `S_U` immediately.
+  4. Enhanced `try_url_variants()`: now also generates a `/v1`-prefixed variant when the stored base has no explicit version segment.
+  5. Added `api.minimax.chat` → `MINIMAX` mapping in `detect_provider()`, covering both MiniMax official domains.
+- **Bumped all script version strings** to `v7.17.0` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, `auto_bootstrap.py`, and `SKILL.md`.
 
 ### v7.15.0 (2026-08-13)
-- Removed repository-embedded Feishu Bitable identifiers; load them from environment variables or local Hermes configuration instead.
-- Removed obsolete note-field usage helpers that were no longer called.
 - Reconciled README and operational documentation with the actual priority-tier and provider behavior.
 
 ### v7.14.2 (2026-08-10)
