@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
-version: 7.17.0
+version: 7.18.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.17.0
+# Credential Pool Sync v7.18.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -429,6 +429,13 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.18.0 (2026-08-15)  Claude Code 凭证池恢复与按优先级切换完善
+- **凭证池不再永久卡死在"限流/额度耗尽"**：`refresh()` 只剔除硬性失效（无效/停用），不再永久排除"额度耗尽/限流"；`_sync_dashboard` 探活通过即把"⛔ 限流/⚠️ 额度耗尽"恢复写回"✅ 正常"。
+- **区分可恢复与永久状态**：`mark_exhausted` 改为 `mark_failure(credential, status, reason)`——429 标"⛔ 限流"，402/403 标"⚠️ 额度耗尽"，均记入 `_bad`。
+- **按优先级切换只到健康凭证**：`next_after` 与 `rotate` 跳过 `_bad` 中的已耗尽 key，避免下一请求再打中失效 key；自动/手动切换均写回"🔄 使用中"。
+- **新增 `_bad` 集合**：运行时累积失败 key，周期 `refresh` 探活前清空，实现恢复后重新可用。
+- 涉及脚本：`claude_credential_proxy.py`。
 
 ### v7.17.0 (2026-08-14)
 - **Fixed MiniMax/DeepSeek health check false failures (S_U)**:
