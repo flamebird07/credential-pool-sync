@@ -120,6 +120,8 @@ class CredentialPool:
         self._known_status: dict[str, str] = {}
         self._bad: set[str] = set()
         self._index = 0
+        self._active_tier: int = 0
+        self._by_tier: dict[int, list[Credential]] = {}
         self._token_cache: str = ""
         self._token_ts: float = 0.0
         self._lock = threading.RLock()
@@ -168,19 +170,45 @@ class CredentialPool:
                 continue
             credentials.append(Credential(record.get("record_id", ""), api_key, base_url.rstrip("/"), field(fields, "model"), priority, field(fields, "label")))
         credentials.sort(key=lambda item: item.priority)
-        self._bad.clear()
-        credentials = self._health_filter(credentials)
-        if not credentials:
+        healthy = self._health_filter(credentials)
+        if not healthy:
             raise RuntimeError("No healthy credentials in the Claude Code Feishu table")
+        by_tier = self._group_by_tier(healthy)
         with self._lock:
-            current_identity = credential_identity(self._credentials[self._index]) if self._credentials else None
-            self._credentials = credentials
+            # 先按本轮探活结果清洗 _bad：恢复健康（进入 healthy 集合）的 key 解除标记，
+            # 仍探活失败（degraded、不在 healthy）的 key 跨 refresh 保留。
+            healthy_keys = {c.api_key for c in healthy}
+            self._bad = {key for key in self._bad if key not in healthy_keys}
+            active_tier = self._select_active_tier(by_tier, self._bad)
+            if active_tier < 0:
+                active_tier = min(by_tier)
+            self._by_tier = by_tier
+            self._active_tier = active_tier
             self._incomplete_records = incomplete_records
-            self._index = next((i for i, item in enumerate(credentials) if credential_identity(item) == current_identity), 0)
+            current_identity = credential_identity(self._credentials[self._index]) if self._credentials else None
+            self._credentials = list(by_tier[active_tier])
+            self._index = next(
+                (i for i, item in enumerate(self._credentials) if credential_identity(item) == current_identity and item.api_key not in self._bad),
+                0,
+            )
             active = self._credentials[self._index]
-        self._sync_dashboard(credentials, active)
+        self._sync_dashboard(healthy, active)
         self._mark_incomplete_records(incomplete_records)
-        return list(credentials)
+        return list(healthy)
+
+    def _group_by_tier(self, credentials: list[Credential]) -> dict[int, list[Credential]]:
+        """按 0-9 优先级分档（0 最高）。只含健康探活通过的凭证。"""
+        by_tier: dict[int, list[Credential]] = {}
+        for credential in credentials:
+            by_tier.setdefault(credential.priority, []).append(credential)
+        return by_tier
+
+    def _select_active_tier(self, by_tier: dict[int, list[Credential]], bad: set[str]) -> int:
+        """返回最高优先（最低档号）且含 ≥1 健康未耗尽凭证的档；无则 -1。"""
+        for tier in range(10):
+            if any(credential.api_key not in bad for credential in by_tier.get(tier, [])):
+                return tier
+        return -1
 
     def _health_filter(self, credentials: list[Credential]) -> list[Credential]:
         """Probe the Anthropic Messages API that Claude Code actually calls."""
@@ -269,21 +297,27 @@ class CredentialPool:
         with self._lock:
             if not self._credentials:
                 self.refresh()
+            for offset in range(len(self._credentials)):
+                candidate = self._credentials[(self._index + offset) % len(self._credentials)]
+                if candidate.api_key not in self._bad:
+                    self._index = (self._index + offset) % len(self._credentials)
+                    return candidate
             return self._credentials[self._index]
 
     def next_after(self, failed: Credential) -> Credential | None:
         with self._lock:
             if not self._credentials:
                 return None
-            failed_identity = credential_identity(failed)
-            start = next((i for i, item in enumerate(self._credentials) if credential_identity(item) == failed_identity), self._index)
+            start = next((i for i, item in enumerate(self._credentials) if credential_identity(item) == credential_identity(failed)), self._index)
             for offset in range(1, len(self._credentials)):
                 candidate = self._credentials[(start + offset) % len(self._credentials)]
-                if credential_identity(candidate) != failed_identity and candidate.api_key not in self._bad:
+                if candidate.api_key != failed.api_key and candidate.api_key not in self._bad:
                     self._index = (start + offset) % len(self._credentials)
                     break
             else:
-                return None
+                if not self._advance_tier():
+                    return None
+            candidate = self._credentials[self._index]
         try:
             self._write_ui_state(
                 candidate,
@@ -295,23 +329,41 @@ class CredentialPool:
         return candidate
 
     def rotate(self) -> Credential | None:
-        """Manually advance to the next healthy (non-degraded) credential."""
+        """Manually advance within the active tier; advance a tier only when it is exhausted."""
         with self._lock:
             if not self._credentials:
                 return None
             start = self._index
-            for offset in range(1, len(self._credentials) + 1):
+            for offset in range(1, len(self._credentials)):
                 candidate = self._credentials[(start + offset) % len(self._credentials)]
                 if candidate.api_key not in self._bad:
                     self._index = (start + offset) % len(self._credentials)
                     break
             else:
-                return None
+                if not self._advance_tier():
+                    return None
+            candidate = self._credentials[self._index]
         try:
             self._write_ui_state(candidate, "🔄 Claude Code 使用中", f"手动切换成功；当前模型：{candidate.model or '未填写'}")
         except Exception as error:
             print(f"WARNING: unable to mark active credential: {error}", file=sys.stderr)
         return candidate
+
+    def _advance_tier(self) -> bool:
+        """active 档耗尽后推进到下一个仍含健康可选用凭证的档。"""
+        for tier in sorted(self._by_tier):
+            if tier <= self._active_tier:
+                continue
+            available = [i for i, c in enumerate(self._by_tier[tier]) if c.api_key not in self._bad]
+            if available:
+                self._active_tier = tier
+                self._credentials = list(self._by_tier[tier])
+                self._index = available[0]
+                return True
+        return False
+
+    def _total_healthy(self) -> int:
+        return sum(len(credentials) for credentials in self._by_tier.values())
 
     def mark_failure(self, credential: Credential, status: int, reason: str) -> None:
         if not credential.record_id:
@@ -441,7 +493,9 @@ class Handler(BaseHTTPRequestHandler):
         # process, so a quota event is invisible to its development session.
         attempts = 0
         all_failed = False
-        while credential and attempts < max(1, len(self.pool._credentials)):
+        # 档位跨档推进时循环上限取全部健康凭证总数，避免 active 档耗尽后提前退出
+        total_healthy = self.pool._total_healthy()
+        while credential and attempts < max(1, total_healthy):
             # Stream the first upstream 2xx straight back to Claude Code
             # instead of buffering the whole body; on_headers/on_chunk only
             # forward a 2xx, so quota failures still buffer for the retry loop.

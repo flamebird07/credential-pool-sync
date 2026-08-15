@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
-version: 7.18.0
+version: 7.19.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -10,7 +10,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.18.0
+# Credential Pool Sync v7.19.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -429,6 +429,13 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.19.0 (2026-08-15) Claude Code 凭证池按优先级自动切换
+- **实现 active 档（收窄最高有效档）语义**：`refresh()` 健康检查后 `_group_by_tier` 按 0-9 优先级分档 → `_select_active_tier` 只把最高有效档（含 ≥1 健康未耗尽凭证的最低档）的凭证进 `_credentials`，低优先级档不再混入活动池。
+- **档内优先切换、档内耗尽才推进**：`next_after`/`rotate` 先在 active 档内按优先级找下一个健康凭证，档内全耗尽才 `_advance_tier()` 推进下一档；`current()` 档内跳过 `_bad`。
+- **`_bad` 跨 refresh 保留并自动恢复**：当前档位内仍探活失败的 key 保留标记，重新探活通过（进入 healthy）的 key 自动解除 `_bad`，恢复为可选用，避免恢复凭证永久滞留被排除。
+- **重试上限跨档**：`do_POST` 重试循环上限改为全部健康凭证总数，跨档推进时不提前退出。
+- 涉及脚本：`claude_credential_proxy.py`。
 
 ### v7.18.0 (2026-08-15)  Claude Code 凭证池恢复与按优先级切换完善
 - **凭证池不再永久卡死在"限流/额度耗尽"**：`refresh()` 只剔除硬性失效（无效/停用），不再永久排除"额度耗尽/限流"；`_sync_dashboard` 探活通过即把"⛔ 限流/⚠️ 额度耗尽"恢复写回"✅ 正常"。
