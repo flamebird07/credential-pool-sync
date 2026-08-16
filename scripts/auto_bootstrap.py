@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select the first healthy credential and atomically update Hermes config. v7.17.0"""
+"""Select the first healthy credential and atomically update Hermes config. v7.20.0"""
 
 import json
 import os

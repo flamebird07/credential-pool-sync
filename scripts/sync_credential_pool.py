@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.17.0 — 含连通性验证、状态回写和安全配置加载。"""
+"""凭证池同步脚本 v7.20.0 — 含连通性验证、状态回写和安全配置加载。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -938,7 +938,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.17.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.20.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []
@@ -1181,14 +1181,15 @@ def mark_runtime_failure(failure_kind):
             continue
         if record["model"].strip().lower() == model and normalise_base_url(record["base_url"]) == base_url:
             matches.append(record)
-    if len(matches) != 1:
-        raise ValueError(f"runtime failure identity matched {len(matches)} Feishu records")
+    if not matches:
+        raise ValueError("runtime failure identity matched 0 Feishu records")
 
     rate_limited = failure_kind in {"rate_limit", "billing", "upstream_rate_limit"}
     status = S_R if rate_limited else S_U
     note = f"Hermes runtime failure: {failure_kind}"
-    us(token, matches[0]["record_id"], status, note=note)
-    print(f"Marked runtime failure for {matches[0]['label'] or matches[0]['model']}: {failure_kind}")
+    for m in matches:
+        us(token, m["record_id"], status, note=note)
+        print(f"Marked runtime failure for {m['label'] or m['model']}: {failure_kind}")
 
 
 def main():

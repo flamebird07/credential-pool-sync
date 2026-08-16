@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-凭证池技能一键部署脚本 v7.17.0
+凭证池技能一键部署脚本 v7.20.0
 
 在任何安装了本技能的 Hermes 机器上运行一次，即可完成全部配置：
   1. 检查飞书机器人凭证与目标多维表格的读写权限
@@ -412,7 +412,7 @@ def main():
     skip_bootstrap = args.skip_bootstrap or args.sync_only
 
     print("=" * 60)
-    print("🔧 凭证池技能一键部署 v7.17.0")
+    print("🔧 凭证池技能一键部署 v7.20.0")
     print("=" * 60)
     print(f"技能目录: {SKILL_DIR}")
     print(f"Hermes 配置: {get_config_path()}")

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.17.0。"""
+"""切换到下一个可用凭证 v7.20.0。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 
