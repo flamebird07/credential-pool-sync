@@ -1,7 +1,7 @@
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
-version: 7.19.0
+version: 7.20.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -429,6 +429,11 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.20.0 (2026-08-16)
+
+- **Fixed `mark_runtime_failure` multi-match bug**: When multiple Feishu records share the same `(model, base_url)` (e.g. two ARK records with `doubao-seed-2-1-turbo`), the function previously raised `ValueError` because `len(matches) != 1`. The runtime failure was never written to Feishu, so records stayed "✅ 正常" and kept being selected on next sync, causing infinite 429 loops. Now all matching records are marked as failed (they share the same model endpoint and would all fail the same way).
+- **Bumped all script version strings** to `v7.20.0` across `sync_credential_pool.py`, `switch_next.py`, `cleanup_feishu_status.py`, `setup.py`, and `SKILL.md`.
 
 ### v7.19.0 (2026-08-15) Claude Code 凭证池按优先级自动切换
 - **实现 active 档（收窄最高有效档）语义**：`refresh()` 健康检查后 `_group_by_tier` 按 0-9 优先级分档 → `_select_active_tier` 只把最高有效档（含 ≥1 健康未耗尽凭证的最低档）的凭证进 `_credentials`，低优先级档不再混入活动池。
