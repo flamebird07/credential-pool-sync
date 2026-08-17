@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.20.0 — 含连通性验证、状态回写和安全配置加载。"""
+"""凭证池同步脚本 v7.21.0 — 含连通性验证、状态回写和安全配置加载。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -24,7 +24,12 @@ from urllib.parse import urlparse
 from contextlib import contextmanager
 from pathlib import Path
 
-def request_with_retry(req, timeout=8, max_retries=2):
+# 健康检查默认超时（秒）。原硬编码 8s 在跨境/高延迟 Provider 上易误判超时。
+HEALTH_CHECK_TIMEOUT = 15
+# 部分 Provider 首字节延迟较高，需要更长的健康检查超时。
+_PROVIDER_TIMEOUT_OVERRIDE = {"MINIMAX": 25, "XIAOMI": 25}
+
+def request_with_retry(req, timeout=HEALTH_CHECK_TIMEOUT, max_retries=2):
     for i in range(max_retries):
         try:
             resp = urllib.request.urlopen(req, timeout=timeout)
@@ -33,6 +38,26 @@ def request_with_retry(req, timeout=8, max_retries=2):
             if (e.code == 429 or e.code >= 500) and i < max_retries - 1:
                 time.sleep(2 ** i * (0.5 + random.random() * 0.5))
                 continue
+            raise
+        except (urllib.error.URLError, OSError):
+            if i == max_retries - 1:
+                raise
+            time.sleep(2 ** i * (0.5 + random.random() * 0.5))
+
+
+def _health_request(request, timeout, max_retries=2):
+    """轻量重试的健康探测请求。
+
+    仅对连接级异常（URLError/超时）退避重试；HTTP 状态码原样抛出，交由
+    ``tk()`` 的分支判定，避免把端点不存在的 404 与网络抖动混淆。
+    成功时返回 (code, body)。
+    """
+    for i in range(max_retries):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as response:
+                return response.getcode(), response.read()
+        except urllib.error.HTTPError:
+            # HTTP 状态码原样抛出，由 tk() 分支判定，不在此重试。
             raise
         except (urllib.error.URLError, OSError):
             if i == max_retries - 1:
@@ -225,18 +250,30 @@ def us(t, rid, s=None, note=None, provider=None, base_url=None):
         return
     request_with_retry(urllib.request.Request(f"https://open.feishu.cn/open-apis/bitable/v1/apps/{base_token}/tables/{table_id}/records/{rid}", data=json.dumps({"fields": f}).encode(), headers=h, method="PUT"), timeout=10)
 
-def endpoint_candidates(base_url):
+def endpoint_candidates(base_url, provider=None):
     """Return protocol paths for exactly one configured credential route.
 
     A credential's Plan route is part of its identity.  Do not strip a
     ``/v1`` or ``/v3`` suffix and then probe another Plan/version: doing so
     can use Coding-Plan's response to classify Agent-Plan (or vice versa).
+
+    The ``/messages`` (Anthropic) candidate is only generated for the
+    Anthropic family (ANTHROPIC/LONGCAT，或 URL 含 ``/messages``/``/anthropic``)；
+    对其它 Provider 探测 ``/messages`` 只会得到误导性的 404/405。
     """
     base = _strip_endpoint_suffix(base_url)
-    candidates = [f"{base}/chat/completions", f"{base}/messages"]
+    base_l = base.lower()
+    provider_l = str(provider or "").strip().lower()
+    is_anthropic_family = (
+        provider_l in ("anthropic", "longcat")
+        or "/messages" in base_l
+        or "/anthropic" in base_l
+    )
+    candidates = [f"{base}/chat/completions"]
+    if is_anthropic_family:
+        candidates.append(f"{base}/messages")
     # MiniMax and similar providers use /anthropic path which 404s on both
     # /chat/completions and /messages; add /v1/chat/completions as fallback
-    base_l = base.lower()
     if base_l.endswith("/anthropic"):
         root = base[:-len("/anthropic")].rstrip("/")
         candidates.append(f"{root}/v1/chat/completions")
@@ -283,6 +320,22 @@ def detect_provider(base_url):
     return None
 
 
+def _health_timeout(base_url, provider=None):
+    """返回指定 Provider/base_url 的健康检查超时（秒）。
+
+    MINIMAX/XIAOMI 首字节延迟较高，使用更长的超时；其余走默认
+    ``HEALTH_CHECK_TIMEOUT``。当 provider 字段缺失或为 custom 时，回退到
+    基于 host 的推断，保证探测窗口与目标 Provider 匹配。
+    """
+    provider_l = str(provider or "").strip().upper()
+    if provider_l in _PROVIDER_TIMEOUT_OVERRIDE:
+        return _PROVIDER_TIMEOUT_OVERRIDE[provider_l]
+    host = (urlparse(str(base_url or "")).hostname or "").lower()
+    if "minimax" in host or "xiaomi" in host:
+        return _PROVIDER_TIMEOUT_OVERRIDE["MINIMAX"]
+    return HEALTH_CHECK_TIMEOUT
+
+
 def try_url_variants(base_url):
     """Keep health checks on the exact route stored in Feishu.
 
@@ -315,9 +368,16 @@ def model_limits(model_name):
 def tk(p, ak, bu, m):
     if not ak or not bu:
         return False, S_I, "缺少必填", ""
-    candidates = [endpoint for variant in try_url_variants(bu) for endpoint in endpoint_candidates(variant)]
+    candidates = [endpoint for variant in try_url_variants(bu) for endpoint in endpoint_candidates(variant, p)]
     last_error = None
+    # root_cause 仅在首次真实失败时写入；404/405 视为端点不存在，不覆盖它，
+    # 避免后置的 404 抹掉更早的超时等首因。
+    root_cause = None
+    # last_endpoint 记录真正失败的端点；端点缺失（404/405）不更新它，
+    # 以便返回端点缺失时回退到最后一个候选。
+    last_endpoint = None
     last_status = S_U
+    timeout = _health_timeout(bu, p)
     for endpoint in candidates:
         anthropic = endpoint.endswith("/messages")
         model = m or ("claude-sonnet-4-20250514" if anthropic else "deepseek-v4-flash")
@@ -333,9 +393,7 @@ def tk(p, ak, bu, m):
             payload = {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ok"}]}
         request = urllib.request.Request(endpoint, data=json.dumps(payload).encode(), headers=headers)
         try:
-            with urllib.request.urlopen(request, timeout=8) as response:
-                code = response.getcode()
-                body = response.read()
+            code, body = _health_request(request, timeout=timeout)
             if 200 <= code < 300:
                 # 某些 Provider（如 ARK）会在 200 响应体里返回账号级错误码
                 try:
@@ -358,7 +416,11 @@ def tk(p, ak, bu, m):
                 return False, S_R, "HTTP 429: rate limited", endpoint.rstrip("/")
             if code in (401, 403):
                 return False, S_I, f"HTTP {code}: Key invalid", endpoint.rstrip("/")
-            last_error = f"HTTP {code}"
+            # 非 2xx 但未抛 HTTPError 的罕见情况，按服务暂不可用处理。
+            root_cause = root_cause or f"HTTP {code}"
+            last_endpoint = endpoint.rstrip("/")
+            last_error = root_cause
+            last_status = S_U
             continue
         except urllib.error.HTTPError as exc:
             if exc.code == 429:
@@ -367,6 +429,7 @@ def tk(p, ak, bu, m):
                 # 非 Anthropic/longcat 的 /messages 端点返回 401/403 属于端点不匹配，
                 # 直接跳过并保留更早的错误信息（如 404 模型不存在）
                 if endpoint.endswith("/messages") and "anthropic" not in endpoint.lower() and "longcat" not in endpoint.lower():
+                    last_status = S_U
                     continue
                 return False, S_I, "Key 无效", endpoint.rstrip("/")
             if exc.code == 404:
@@ -374,24 +437,41 @@ def tk(p, ak, bu, m):
                 # candidate endpoint instead of immediately marking the
                 # credential as S_U. If all candidates 404, the final return
                 # at the end of the loop will report S_U with the last error.
+                # 端点不存在不覆盖已有 root_cause，也不更新 last_endpoint。
                 last_error = "HTTP 404"
+                last_status = S_U
                 continue
             if exc.code == 405:
                 last_error = "HTTP 405"
+                last_status = S_U
                 continue
             if 400 <= exc.code < 500:
                 # 这些 4xx 可能是端点/版本不匹配（如命中 /v3 而服务端只提供
                 # /v1，或 plan 后缀错误），记录错误并继续尝试后续候选端点，
                 # 而不是立即把凭据标记为 S_U。
-                last_error = f"HTTP {exc.code}"
+                root_cause = root_cause or f"HTTP {exc.code}"
+                last_endpoint = endpoint.rstrip("/")
+                last_error = root_cause
+                last_status = S_U
                 continue
-            return False, S_U, f"HTTP {exc.code}: 服务暂不可用", endpoint.rstrip("/")
-        except (urllib.error.URLError, OSError) as exc:
-            last_error = f"连接失败: {str(exc)[:80]}"
+            # 5xx：服务暂不可用，记录真正失败的端点与首因。
+            root_cause = root_cause or f"HTTP {exc.code}"
+            last_endpoint = endpoint.rstrip("/")
+            last_error = f"HTTP {exc.code}: 服务暂不可用"
+            last_status = S_U
             continue
+        except (urllib.error.URLError, OSError) as exc:
+            # 超时/连接失败说明已触达 Provider 主机，继续试 /messages 等
+            # 其它候选只会得到误导性 404，直接终止遍历。
+            root_cause = root_cause or f"连接失败: {str(exc)[:80]}"
+            last_endpoint = endpoint.rstrip("/")
+            last_error = root_cause
+            last_status = S_U
+            break
         except Exception as exc:
             return False, S_U, f"异常: {str(exc)[:80]}", endpoint.rstrip("/")
-    return False, last_status, last_error or "无可用端点", candidates[-1].rstrip("/")
+    final_endpoint = last_endpoint or (candidates[-1].rstrip("/") if candidates else "")
+    return False, last_status, root_cause or last_error or "无可用端点", final_endpoint
 
 
 @contextmanager
@@ -938,7 +1018,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.20.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.21.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []
