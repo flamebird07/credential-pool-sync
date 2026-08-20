@@ -21,7 +21,10 @@ from claude_credential_proxy import CONFIG_PATH, FEISHU_API, feishu_token, herme
 
 DEFAULT_PORT = int(os.getenv("CLAUDE_POOL_PROXY_PORT", "21435"))
 # Statuses written by the proxy; anything else is left untouched.
-PROXY_STATUSES = {"🔄 Claude Code 使用中", "⚠️ 额度耗尽", "⛔ 限流", "❌ 无效", "❌ Claude 不兼容", "⚠️ 不可用", "✅ 正常"}
+PROXY_STATUSES = {
+    "🔄 Claude Code 使用中", "⚠️ 额度耗尽", "⛔ 限流", "❌ 无效",
+    "❌ Claude 不兼容", "⚠️ 不可用", "⚪ 未配置", "✅ 正常",
+}
 
 
 def bitable(token: str, path: str, method: str = "GET", payload: dict | None = None) -> dict:

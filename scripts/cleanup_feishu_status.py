@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile Feishu credential status with the active Hermes model v7.21.0。"""
+"""Reconcile Feishu credential status with the active Hermes model v7.23.0。"""
 
 import os
 import sys
@@ -13,16 +13,17 @@ if os.path.isdir(_hermes_site_packages) and _hermes_site_packages not in sys.pat
 import yaml
 from sync_credential_pool import (
     S_A, S_I, S_R, S_U,
+    _normalise_record,
     detect_provider,
     get_agent_name,
     get_runtime_config_path,
     gr,
     gt,
-    health_status,
+    group_by_priority,
+    identity as pool_identity,
     locked_path,
     normalise_base_url,
-    status_add,
-    status_remove,
+    reconcile_agent_status,
     tk,
     us,
 )
@@ -50,7 +51,7 @@ def active_identity():
     model = config.get("model") or {}
     if not isinstance(model, dict):
         return ("", "", "")
-    return identity(model.get('default',''), model.get('api_key',''), model.get('base_url',''))
+    return pool_identity(model.get('api_key', ''), model.get('base_url', ''), model.get('default', ''))
 
 
 def repair_feishu_providers():
@@ -89,49 +90,83 @@ def cleanup_feishu_status():
     agent_name = get_agent_name()
     current = active_identity()
 
+    fields_by_id = {
+        record.get("record_id", ""): record.get("fields", {}) or {}
+        for record in records
+    }
+
+    normalised_records: list[dict] = []
     for record in records:
-        record_id = record.get("record_id")
-        fields = record.get("fields") or {}
-        if not record_id:
+        normalised = _normalise_record(record)
+        if normalised is None:
             continue
-        api_key = value(fields, "API Key")
-        base_url = value(fields, "Base URL")
-        model = value(fields, "模型")
+        record_id = normalised["record_id"]
+        fields = fields_by_id.get(record_id, {})
+        # _normalise_record() already applied detect_provider() with the "custom"
+        # sentinel fallback, so normalised["provider"] is the value we want to
+        # keep. However we still need to flag a provider write-back when the
+        # user-saved field differs from the inferred one.
+        inferred_provider = detect_provider(normalised["base_url"])
         current_provider = value(fields, "Provider")
-        current_status = value(fields, "状态")
-        current_note = value(fields, "备注")
-
-        inferred_provider = detect_provider(base_url)
         provider_update = None
-        provider_for_check = current_provider
-
         if inferred_provider and (
             not current_provider or current_provider.lower() == "custom"
         ):
-            provider_for_check = inferred_provider
             provider_update = inferred_provider
+        normalised["provider_update"] = provider_update
+        normalised_records.append(normalised)
 
-        is_valid, probe_status, error, _used_url = tk(
-            provider_for_check, api_key, base_url, model
+    records_by_tier = group_by_priority(normalised_records)
+    health_results: dict[tuple[str, str, str], tuple[bool, str, str | None, str]] = {}
+    checked: dict[tuple[str, str, str], tuple[dict, tuple[bool, str, str | None, str], str, str, str | None]] = {}
+    for normalised in normalised_records:
+        result = tk(
+            normalised.get("provider", ""),
+            normalised["api_key"],
+            normalised["base_url"],
+            normalised["model"],
         )
-        
-        # 状态栏显示 Agent 使用信息，备注保留原始说明
+        key = pool_identity(normalised["api_key"], normalised["base_url"], normalised["model"])
+        health_results[key] = result
+        record_id = normalised["record_id"]
+        fields = fields_by_id.get(record_id, {})
+        checked[key] = (
+            normalised,
+            result,
+            value(fields, "状态"),
+            value(fields, "备注"),
+            normalised.get("provider_update"),
+        )
+
+    valid_tiers = {
+        tier
+        for tier, members in records_by_tier.items()
+        if any(
+            health_results[pool_identity(r["api_key"], r["base_url"], r["model"])][0]
+            for r in members
+        )
+    }
+
+    for key, (normalised, result, current_status, current_note, provider_update) in checked.items():
+        is_valid, probe_status, error, _used_url = result
+        tier = normalised["priority"]
+        record_id = normalised["record_id"]
+        fields = fields_by_id.get(record_id, {})
+        original_key = pool_identity(
+            normalised["api_key"],
+            normalise_base_url(value(fields, "Base URL")),
+            normalised["model"],
+        )
+        is_current = tier in valid_tiers and (key == current or original_key == current)
+        new_status = reconcile_agent_status(current_status, agent_name, is_current, is_valid, probe_status, error)
         if is_valid:
-            if identity(model, api_key, base_url) == current:
-                new_status = status_add(current_status, agent_name)
-            else:
-                new_status = status_remove(current_status, agent_name)
-            new_note = '验证通过'
+            new_note = "验证通过"
+        elif probe_status == S_R:
+            new_note = error or "额度已用完"
+        elif probe_status == S_I:
+            new_note = error or "Key 无效"
         else:
-            # 健康检查失败，设置健康状态
-            new_status = health_status(False, probe_status, error)
-            if probe_status == '⛔ 限流':
-                new_note = error or '额度已用完'
-            elif probe_status == '❌ 无效':
-                new_note = error or 'Key 无效'
-            else:
-                new_note = error or '验证失败'
-        
+            new_note = error or "验证失败"
         if (
             new_status != current_status
             or new_note != current_note

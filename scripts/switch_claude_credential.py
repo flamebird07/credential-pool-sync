@@ -31,7 +31,16 @@ def main() -> int:
     args = parser.parse_args()
 
     url = f"http://{args.host}:{args.port}/switch"
-    request = Request(url, data=b"", method="POST")
+    control_token = os.getenv("CLAUDE_POOL_CONTROL_TOKEN", "").strip()
+    if not control_token:
+        print("切换失败：未设置 CLAUDE_POOL_CONTROL_TOKEN", file=sys.stderr)
+        return 2
+    request = Request(
+        url,
+        data=b"",
+        headers={"Authorization": f"Bearer {control_token}"},
+        method="POST",
+    )
     try:
         with urlopen(request, timeout=10) as response:
             result = json.loads(response.read())
@@ -43,9 +52,9 @@ def main() -> int:
         return 1
 
     if result.get("ok"):
-        print(f"已切换：{result.get('from') or '上一个'} -> {result.get('to') or '（池为空）'}；当前模型：{result.get('model') or '未填写'}")
+        print(f"已切换：{result.get('from') or '上一个'} -> {result.get('to')}；当前模型：{result.get('model') or '未填写'}")
         return 0
-    print(f"切换失败：{result.get('error', '未知错误')}", file=sys.stderr)
+    print(f"切换失败：{result.get('error', '无可用下一档凭证')}", file=sys.stderr)
     return 1
 
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.21.0 — 含连通性验证、状态回写和安全配置加载。"""
+"""凭证池同步脚本 v7.23.0 — 含连通性验证、状态回写和安全配置加载。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -211,6 +211,24 @@ def health_status(is_valid, status, error=None):
     if status == S_I or "401" in detail or "403" in detail or "无效" in detail:
         return S_I
     return S_U
+
+
+def reconcile_agent_status(current_status, agent_name, is_current, is_valid, probe_status, error=None):
+    """Apply a health result while preserving ownership by other Agents.
+
+    - Valid + this Agent is on the active credential → add the Agent marker.
+    - Valid + this Agent is not on the active credential → strip the Agent marker.
+    - Invalid → strip the Agent marker; if no Agent remains, fall back to the
+      bare health status so the user can still see 限流/不可用/无效。
+    """
+    base_status = health_status(is_valid, probe_status, error)
+    if is_valid and is_current:
+        merged = status_add(current_status, agent_name)
+    else:
+        merged = status_remove(current_status, agent_name)
+        if not agents(merged):
+            merged = base_status
+    return merged
 
 def gt():
     app_id, app_secret = load_feishu_credentials()
@@ -840,9 +858,24 @@ def update_runtime_main_model(record):
 
 def priority(value):
     """Normalised 0-9. Out-of-range / non-integer -> 9 (lowest) + warning.
-    0 is highest priority, 9 is lowest. Never drops a record; never promotes it."""
+    0 is highest priority, 9 is lowest. Never drops a record; never promotes it.
+
+    Accepts Feishu rich-text (list-of-dicts with "text" keys), numeric 1.0,
+    or plain integers. Non-integer numerics (e.g. 1.2) and unparseable strings
+    fall back to tier 9 with a stderr warning."""
+    if isinstance(value, list):
+        text = "".join(
+            str(item.get("text", "")) if isinstance(item, dict) else str(item) for item in value
+        )
+    elif isinstance(value, dict):
+        text = str(value.get("text") or "")
+    else:
+        text = value
     try:
-        p = int(value)
+        numeric = float(text)
+        if not numeric.is_integer():
+            raise ValueError
+        p = int(numeric)
     except (TypeError, ValueError):
         print(f"WARNING: 非法优先级 {value!r}，按档 9 处理", file=sys.stderr)
         return 9
@@ -945,6 +978,8 @@ def collect_active_tier(records_by_tier, skip_health_rotate=False, *, current_id
             rid = normalised.get("record_id", "")
             original_provider = str(normalised.get("original_provider") or "").strip()
             detected_provider = detect_provider(bu)
+            original_base_url = bu
+            original_identity = identity(ak, original_base_url, m)
             if skip_health_rotate:
                 iv, s, e, _used_url = True, S_A, None, ""
             else:
@@ -953,7 +988,7 @@ def collect_active_tier(records_by_tier, skip_health_rotate=False, *, current_id
                 if iv:
                     healed_url = endpoint_base_url(_used_url)
                     if healed_url and healed_url != bu:
-                        healed_urls[identity(ak, bu, m)] = healed_url
+                        healed_urls[original_identity] = healed_url
                         url_updates.append((rid, detected_provider or p, healed_url))
                         normalised["base_url"] = healed_url
                         bu = healed_url
@@ -963,8 +998,10 @@ def collect_active_tier(records_by_tier, skip_health_rotate=False, *, current_id
                         url_updates.append((rid, detected_provider, bu))
                         normalised["provider"] = detected_provider
                         p = detected_provider
+            healed_identity = identity(ak, bu, m)
+            is_current = healed_identity == current_identity or original_identity == current_identity
             if health_results is not None:
-                health_results[identity(ak, bu, m)] = (iv, s, e, _used_url)
+                health_results[healed_identity] = (iv, s, e, _used_url)
             if s == S_R:
                 if not skip_health_rotate:
                     print(f"⛔ {s}")
@@ -976,7 +1013,7 @@ def collect_active_tier(records_by_tier, skip_health_rotate=False, *, current_id
                 if not skip_health_rotate:
                     print(f"✅ {s}")
                     # 状态栏显示 Agent 使用信息，备注保留原始说明
-                    if identity(ak, bu, m) == current_identity:
+                    if is_current:
                         new_status = status_add(normalised.get("status") or "", agent_name)
                     else:
                         new_status = status_remove(normalised.get("status") or "", agent_name)
@@ -985,7 +1022,9 @@ def collect_active_tier(records_by_tier, skip_health_rotate=False, *, current_id
                 valid_in_tier.append(normalised)
             else:
                 # 健康检查失败时，设置正确的健康状态，从状态栏移除当前 Agent
-                new_status = health_status(False, s, e)
+                new_status = reconcile_agent_status(
+                    normalised.get("status") or "", agent_name, is_current, False, s, e
+                )
                 h_note = e or s
                 if "404" in str(e or ""):
                     h_note = "HTTP 404: model or account entitlement unavailable"
@@ -1018,7 +1057,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.21.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.23.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []

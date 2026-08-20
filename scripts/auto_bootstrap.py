@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Select the first healthy credential and atomically update Hermes config. v7.21.0"""
+"""Select the first healthy credential and atomically update Hermes config. v7.23.0"""
 
 import json
 import os
@@ -115,9 +115,9 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
             with open(runtime_config, encoding="utf-8") as handle:
                 config = yaml.safe_load(handle) or {}
         current = config.get("model") or {}
-        current_identity = (
+        current_identity = pool_identity(
             current.get("api_key", ""),
-            str(current.get("base_url", "")).strip().lower().rstrip("/"),
+            current.get("base_url", ""),
             current.get("default", ""),
         )
 
@@ -126,7 +126,7 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
 
         # 收窄到 active 档（优先级最高且存在有效凭证的档），只在该档内选候选
         by_tier = group_by_priority(records)
-        _active_tier, active_valid, _health_results, _tier_pending, _healed, _url_updates = collect_active_tier(
+        _active_tier, active_valid, _health_results, tier_pending, _healed, url_updates = collect_active_tier(
             by_tier,
             current_identity=pool_identity(
                 current.get("api_key", ""),
@@ -135,7 +135,26 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
             ),
             agent_name=get_agent_name(),
         )
+        if tier_pending or url_updates:
+            try:
+                state_token = gt()
+                for record_id, new_status, note in tier_pending:
+                    us(state_token, record_id, new_status, note=note or None)
+                for record_id, provider, base_url in url_updates:
+                    us(state_token, record_id, provider=provider, base_url=base_url)
+            except Exception as exc:
+                print(f"WARNING: 同步档位状态/URL 失败: {exc}", file=sys.stderr)
         records = active_valid
+
+        current_index = next(
+            (
+                i for i, record in enumerate(records)
+                if pool_identity(record["api_key"], record["base_url"], record["model"]) == current_identity
+            ),
+            None,
+        )
+        if current_index is not None:
+            records = records[current_index + 1:] + records[:current_index + 1]
 
         for record in records:
             record["base_url"] = str(record.get("base_url", "")).strip().lower().rstrip("/")
@@ -149,7 +168,10 @@ def try_switch(records, attempt, deferred_records, rotation_lock):
                 print(f"Deferring GPT credential (low priority): {record.get('model')}")
                 deferred_records.append(record)
                 continue
-            if (record["api_key"], record["base_url"], record["model"]) == current_identity:
+            record_identity = pool_identity(
+                record["api_key"], record["base_url"], record["model"]
+            )
+            if record_identity == current_identity:
                 continue
             ok, _status, error, _used_url = tk(
                 record.get("provider", ""), record["api_key"], record["base_url"], record["model"]
@@ -182,9 +204,9 @@ def report_exhaustion(records, old_identity):
         if old_identity:
             token = gt()
             for candidate in records:
-                identity = (
+                identity = pool_identity(
                     candidate.get("api_key", ""),
-                    str(candidate.get("base_url", "")).strip().lower().rstrip("/"),
+                    candidate.get("base_url", ""),
                     candidate.get("model", ""),
                 )
                 if identity == old_identity and candidate.get("record_id"):
@@ -241,9 +263,9 @@ def main():
                     old_record_id = None
                     if old_identity:
                         for candidate in records:
-                            candidate_identity = (
+                            candidate_identity = pool_identity(
                                 candidate.get("api_key", ""),
-                                str(candidate.get("base_url", "")).strip().lower().rstrip("/"),
+                                candidate.get("base_url", ""),
                                 candidate.get("model", ""),
                             )
                             if candidate_identity == old_identity:

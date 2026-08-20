@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""切换到下一个可用凭证 v7.21.0。"""
+"""切换到下一个可用凭证 v7.23.0。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt, random
 import uuid
 
@@ -192,7 +192,7 @@ def _normalise_record(record):
     # 反推 Provider：如果 Provider 为空或为 custom，从 URL 推断
     if not provider or provider.lower() == "custom":
         provider = detect_provider(base_url) or provider
-    if not provider or not api_key or api_key == "***":
+    if not api_key or api_key == "***":
         return None
     return {
         "record_id": record.get("record_id", ""),
@@ -231,7 +231,7 @@ def first_healthy(records, current, token=None):
 
     # 收窄到 active 档（优先级最高且存在有效凭证的档），只在此档内选候选
     by_tier = group_by_priority(records)
-    _active_tier, active_valid, _health_results, tier_pending, _healed, _url_updates = collect_active_tier(
+    _active_tier, active_valid, health_results, tier_pending, _healed, _url_updates = collect_active_tier(
         by_tier,
         current_identity=pool_identity(
             (current or {}).get("api_key", ""),
@@ -259,12 +259,11 @@ def first_healthy(records, current, token=None):
     for record in candidates:
         if not record.get("api_key") or not record.get("base_url"):
             continue
-        is_valid, status, error, _used_url = tk(
-            record["provider"],
-            record["api_key"],
-            record["base_url"],
-            record["model"],
-        )
+        key = pool_identity(record["api_key"], record["base_url"], record["model"])
+        result = health_results.get(key) if health_results is not None else None
+        if result is None:
+            raise RuntimeError(f"No health result for active-tier credential {key!r}")
+        is_valid, status, error, _used_url = result
         if is_valid:
             target = record.copy()
             if old_record:
@@ -359,31 +358,35 @@ def main():
         try:
             token = gt()
             agent_name = get_agent_name()
+            feishu_records = gr(token)
+            new_r = next(
+                (r for r in feishu_records if r["record_id"] == target["record_id"]),
+                None,
+            )
+            if new_r:
+                current_status = new_r.get("fields", {}).get("状态", "")
+                new_status = status_add(current_status, agent_name)
+                us(token, target["record_id"], new_status, note="验证通过")
+
             if target.get("old_record_id"):
                 old_r = next(
-                    r for r in gr(token)
-                    if r["record_id"] == target["old_record_id"]
+                    (r for r in feishu_records if r["record_id"] == target["old_record_id"]),
+                    None,
                 )
-                old_status = old_r.get("fields", {}).get("状态", "")
-                # 从状态栏移除旧凭证的 Agent 标记
-                new_status = status_remove(old_status, agent_name)
-                old_status_val = target.get("old_status", "")
-                if S_R in old_status_val or "限流" in old_status_val or "额度" in old_status_val:
-                    old_note = "额度已用完"
-                elif S_I in old_status_val or "无效" in old_status_val:
-                    old_note = "Key 无效"
-                else:
-                    old_note = "验证失败"
-                us(token, target["old_record_id"], new_status, note=old_note)
-
-            new_r = next(
-                r for r in gr(token)
-                if r["record_id"] == target["record_id"]
-            )
-            # 在状态栏添加新凭证的 Agent 标记
-            current_status = new_r.get("fields", {}).get("状态", "")
-            new_status = status_add(current_status, agent_name)
-            us(token, target["record_id"], new_status, note="验证通过")
+                if old_r:
+                    old_fields = old_r.get("fields", {})
+                    old_status = old_fields.get("状态", "")
+                    old_note = str(old_fields.get("备注", "") or "").strip()
+                    if not old_note:
+                        old_status_val = target.get("old_status", "")
+                        if S_R in old_status_val or "限流" in old_status_val or "额度" in old_status_val:
+                            old_note = "额度已用完"
+                        elif S_I in old_status_val or "无效" in old_status_val:
+                            old_note = "Key 无效"
+                        else:
+                            old_note = "待命"
+                    new_status = status_remove(old_status, agent_name)
+                    us(token, target["old_record_id"], new_status, note=old_note)
         except Exception as exc:
             print(f"WARNING: 回写飞书状态失败: {exc}", file=sys.stderr)
 

@@ -37,16 +37,36 @@ def provision_table(app_token: str) -> str:
     token = feishu_token()
     app = quote(app_token, safe="")
     tables = bitable(token, f"/apps/{app}/tables").get("items") or []
-    table = next((item for item in tables if item.get("name") == TABLE_NAME), None)
+    configured_id = ""
+    try:
+        configured_id = str(json.loads(CONFIG_PATH.read_text(encoding="utf-8")).get("CLAUDE_POOL_FEISHU_BITABLE_TABLE_ID", "")).strip()
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        pass
+    table = next((item for item in tables if item.get("table_id") == configured_id), None) if configured_id else None
+    if table is None:
+        table = next((item for item in tables if item.get("name") == TABLE_NAME), None)
+    if table is None and configured_id:
+        raise RuntimeError("已配置 Claude 凭证池 table_id 不存在；请恢复表名或更新 table_id，禁止自动新建空表")
     if table is None:
         table = bitable(token, f"/apps/{app}/tables", "POST", {"table": {"name": TABLE_NAME}}).get("table")
-        if not table:
-            raise RuntimeError("飞书未返回新建数据表")
     table_id = str(table.get("table_id") or "")
-    existing = {item.get("field_name") for item in bitable(token, f"/apps/{app}/tables/{quote(table_id, safe='')}/fields").get("items", [])}
+    if not table_id:
+        raise RuntimeError("飞书未返回有效 table_id")
+    existing = {
+        item.get("field_name"): item
+        for item in bitable(token, f"/apps/{app}/tables/{quote(table_id, safe='')}/fields").get("items", [])
+    }
     for name, field_type in FIELDS:
-        if name not in existing:
+        field = existing.get(name)
+        if field is None:
             bitable(token, f"/apps/{app}/tables/{quote(table_id, safe='')}/fields", "POST", {"field_name": name, "type": field_type})
+        elif field.get("type") != field_type:
+            bitable(
+                token,
+                f"/apps/{app}/tables/{quote(table_id, safe='')}/fields/{quote(str(field.get('field_id') or ''), safe='')}",
+                "PATCH",
+                {"type": field_type},
+            )
     return table_id
 
 
