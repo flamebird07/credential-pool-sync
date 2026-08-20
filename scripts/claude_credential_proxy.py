@@ -14,6 +14,7 @@ import os
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -36,6 +37,14 @@ FIELD_ALIASES = {
     "note": ("备注", "Notes", "Note"),
     "label": ("Label", "标签"),
 }
+PROBE_MODEL = "__probe__"  # 兜底，credential.model 为空时使用
+PROBE_TIMEOUT = 10
+PROBE_INTERVAL_HEALTHY = 1500  # 健康凭证每 25 分钟重新探活一次（仅 UI 状态用，真实切换前会再实时检测）
+PROBE_INTERVAL_DEGRADED = 120  # 探活失败凭证每 2 分钟重试一次（快速恢复，避免“不兼容”长时间残留）
+PROBE_FAIL_TOLERANCE = 2  # 任意凭证连续失败达到该次数才降级写坏状态，避免瞬时抖动
+PROBE_SUCCESS_TOLERANCE = 1  # 恢复对称容错：连续成功达到该次数才写回"✅ 正常"（1=立即恢复，因失败方向已有容错防抖动）
+CLAUDE_MODEL_KEYWORDS = ("claude", "sonnet", "opus", "haiku", "fable", "mythos", "glm", "zai-org", "deepseek")
+UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 CONFIG_PATH = Path(os.getenv("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "ClaudeCodeCredentialPool" / "config.json"
 
 
@@ -118,13 +127,17 @@ class CredentialPool:
         self._incomplete_records: list[tuple[str, str]] = []
         self._degraded: list[Credential] = []
         self._known_status: dict[str, str] = {}
-        self._bad: set[str] = set()
+        self._bad: set[tuple[str, str, str]] = set()
         self._index = 0
         self._active_tier: int = 0
         self._by_tier: dict[int, list[Credential]] = {}
         self._token_cache: str = ""
         self._token_ts: float = 0.0
         self._lock = threading.RLock()
+        self._last_probe: dict[str, float] = {}
+        self._consecutive_failures: dict[str, int] = {}
+        self._consecutive_successes: dict[str, int] = {}
+        self._auth_override: dict[tuple[str, str, str], str] = {}
 
     def _token(self) -> str:
         """Reuse the Feishu app_access_token (valid ~2h) for ~110 minutes."""
@@ -165,20 +178,29 @@ class CredentialPool:
             except ValueError:
                 priority = 9
             status = field(fields, "status").lower()
-            # 只剔除硬性失效；限流/额度耗尽是可恢复态，交给健康探活复核后恢复
-            if any(word in status for word in ("无效", "invalid", "停用", "disabled")):
+            # Only rows the user manually disabled stay out of the pool.  Bad
+            # states the proxy wrote itself ("❌ 无效" / "⚠️ 额度耗尽") are probed
+            # again every cycle so they can auto-recover instead of being locked.
+            if any(word in status for word in ("停用", "disabled")):
                 continue
-            credentials.append(Credential(record.get("record_id", ""), api_key, base_url.rstrip("/"), field(fields, "model"), priority, field(fields, "label")))
+            # 重启后恢复内存状态记忆：已健康凭证按 300s 间隔探活、避免 _sync_dashboard
+            # 对全量待命凭证误写"✅ 正常"；坏状态凭证保持降级间隔（180s）以便快速恢复（P10-OS）
+            record_id = str(record.get("record_id") or "")
+            if record_id:
+                status_text = field(fields, "status")
+                if status_text:
+                    self._known_status.setdefault(record_id, status_text)
+            credentials.append(Credential(record_id, api_key, base_url.rstrip("/"), field(fields, "model"), priority, field(fields, "label")))
         credentials.sort(key=lambda item: item.priority)
         healthy = self._health_filter(credentials)
         if not healthy:
             raise RuntimeError("No healthy credentials in the Claude Code Feishu table")
         by_tier = self._group_by_tier(healthy)
         with self._lock:
-            # 先按本轮探活结果清洗 _bad：恢复健康（进入 healthy 集合）的 key 解除标记，
-            # 仍探活失败（degraded、不在 healthy）的 key 跨 refresh 保留。
-            healthy_keys = {c.api_key for c in healthy}
-            self._bad = {key for key in self._bad if key not in healthy_keys}
+            # 先按本轮探活结果清洗 _bad：恢复健康（进入 healthy 集合）的 identity 解除标记，
+            # 仍探活失败（degraded、不在 healthy）的 identity 跨 refresh 保留。
+            healthy_ids = {credential_identity(c) for c in healthy}
+            self._bad = {identity for identity in self._bad if identity not in healthy_ids}
             active_tier = self._select_active_tier(by_tier, self._bad)
             if active_tier < 0:
                 active_tier = min(by_tier)
@@ -188,7 +210,7 @@ class CredentialPool:
             current_identity = credential_identity(self._credentials[self._index]) if self._credentials else None
             self._credentials = list(by_tier[active_tier])
             self._index = next(
-                (i for i, item in enumerate(self._credentials) if credential_identity(item) == current_identity and item.api_key not in self._bad),
+                (i for i, item in enumerate(self._credentials) if credential_identity(item) == current_identity and credential_identity(item) not in self._bad),
                 0,
             )
             active = self._credentials[self._index]
@@ -203,82 +225,174 @@ class CredentialPool:
             by_tier.setdefault(credential.priority, []).append(credential)
         return by_tier
 
-    def _select_active_tier(self, by_tier: dict[int, list[Credential]], bad: set[str]) -> int:
+    def _select_active_tier(self, by_tier: dict[int, list[Credential]], bad: set[tuple[str, str, str]]) -> int:
         """返回最高优先（最低档号）且含 ≥1 健康未耗尽凭证的档；无则 -1。"""
         for tier in range(10):
-            if any(credential.api_key not in bad for credential in by_tier.get(tier, [])):
+            if any(credential_identity(credential) not in bad for credential in by_tier.get(tier, [])):
                 return tier
         return -1
 
     def _health_filter(self, credentials: list[Credential]) -> list[Credential]:
-        """Probe the Anthropic Messages API that Claude Code actually calls."""
-        self._degraded = []
+        """Probe the API family this credential's model speaks; each probe uses
+        its own short timeout so a hung gateway cannot stall the refresh loop.
+        Healthy standby credentials are only re-probed every PROBE_INTERVAL_HEALTHY
+        seconds so the pool does not burn quota on credentials that are not used."""
         healthy: list[Credential] = []
-        body = json.dumps(
-            {"model": "credential-pool-probe", "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
-            separators=(",", ":"),
-        ).encode("utf-8")
-        for credential in credentials:
-            status_code, _headers, response = forward(
-                credential,
-                "/v1/messages",
-                body,
-                {"Content-Type": "application/json", "anthropic-version": "2023-06-01"},
-            )
-            if 200 <= status_code < 300:
-                healthy.append(credential)
-                continue
-            # Keep the failed credential in memory (not the active pool) so a
-            # manual rotate() can still select it again despite bad health.
-            self._degraded.append(credential)
-            detail = response.decode("utf-8", "replace")[:180]
-            if status_code == 429:
-                display_status = "⛔ 限流"
-                note = f"Claude Code 上游检查失败：HTTP 429；{detail or '额度或限流'}"
-            elif status_code in (401, 403):
-                display_status = "❌ 无效"
-                note = f"Claude Code 上游检查失败：HTTP {status_code}；API Key 无效或无权限"
-            elif status_code == 404:
-                display_status = "❌ Claude 不兼容"
-                note = "该 Base URL 不支持 Claude Code 所需的 /v1/messages 接口；请换用 Anthropic 兼容地址"
+        now = time.time()
+        to_probe: list[Credential] = []
+        with self._lock:
+            self._degraded = []
+            for credential in credentials:
+                last = self._last_probe.get(credential.record_id, 0)
+                status_ok = self._known_status.get(credential.record_id) == "✅ 正常"
+                interval = PROBE_INTERVAL_HEALTHY if status_ok else PROBE_INTERVAL_DEGRADED
+                if now - last < interval:
+                    if status_ok:
+                        healthy.append(credential)
+                    else:
+                        self._degraded.append(credential)
+                    continue
+                to_probe.append(credential)
+        def probe(credential: Credential) -> tuple[Credential, int, bytes]:
+            model = credential.model or PROBE_MODEL
+            if is_claude_model(model) or is_anthropic_endpoint(credential.base_url):
+                path = "/v1/messages"
+                headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+                body = json.dumps(
+                    {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
+                    separators=(",", ":"),
+                ).encode("utf-8")
             else:
-                display_status = "⚠️ 不可用"
-                note = f"Claude Code 上游检查失败：HTTP {status_code}；{detail or '请检查上游服务连通性'}"
-            try:
-                self._write_ui_state(credential, display_status, note)
-            except Exception as write_error:
-                print(f"WARNING: unable to write health result: {write_error}", file=sys.stderr)
+                path = "/v1/chat/completions"
+                headers = {"Content-Type": "application/json"}
+                body = json.dumps(
+                    {"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            identity = credential_identity(credential)
+            scheme = self._auth_override.get(identity) or _auth_scheme(model, credential.base_url)
+            status_code, _headers, response = forward(credential, path, body, headers, timeout=PROBE_TIMEOUT, auth_scheme=scheme)
+            if status_code in (401, 403):
+                # 网关对非 Claude 模型的鉴权头可能与默认选择相反；401/403 时用对侧
+                # 鉴权头重试一次，并对命中方做持久学习，覆盖间歇性 401/403 抖动
+                alt = "bearer" if scheme == "x-api-key" else "x-api-key"
+                alt_status, alt_headers, alt_body = forward(credential, path, body, headers, timeout=PROBE_TIMEOUT, auth_scheme=alt)
+                if 200 <= alt_status < 300:
+                    with self._lock:
+                        self._auth_override[identity] = alt
+                    status_code, _headers, response = alt_status, alt_headers, alt_body
+                else:
+                    with self._lock:
+                        self._auth_override.pop(identity, None)
+            return credential, status_code, response
+
+        with ThreadPoolExecutor(max_workers=min(8, len(to_probe) or 1)) as pool:
+            results = list(pool.map(probe, to_probe))
+        with self._lock:
+            for credential, status_code, response in results:
+                self._last_probe[credential.record_id] = now
+                if 200 <= status_code < 300:
+                    self._consecutive_failures.pop(credential.record_id, None)
+                    self._consecutive_successes[credential.record_id] = self._consecutive_successes.get(credential.record_id, 0) + 1
+                    if self._consecutive_successes[credential.record_id] >= PROBE_SUCCESS_TOLERANCE:
+                        try:
+                            self._write_ui_state(credential, "✅ 正常", "Claude Code 凭证池待命（探活通过）")
+                        except Exception as write_error:
+                            print(f"WARNING: unable to write healthy result: {write_error}", file=sys.stderr)
+                    healthy.append(credential)
+                    continue
+                # Keep the failed credential in memory (not the active pool) so a
+                # manual rotate() can still select it again despite bad health.
+                self._degraded.append(credential)
+                self._consecutive_successes.pop(credential.record_id, None)
+                detail = response.decode("utf-8", "replace")[:180]
+                if status_code == 429:
+                    display_status = "⛔ 限流"
+                    note = f"Claude Code 上游检查失败：HTTP 429；{detail or '额度或限流'}"
+                elif status_code in (401, 403):
+                    display_status = "❌ 无效"
+                    note = f"Claude Code 上游检查失败：HTTP {status_code}；API Key 无效或无权限"
+                elif status_code == 404:
+                    display_status = "❌ Claude 不兼容"
+                    note = "该 Base URL 不支持所需的探活接口；请换用 Anthropic / OpenAI 兼容地址"
+                else:
+                    display_status = "⚠️ 不可用"
+                    note = f"Claude Code 上游检查失败：HTTP {status_code}；{detail or '请检查上游服务连通性'}"
+                # 容错：无论当前 _known_status 为何值，连续失败未达阈值不写坏状态（P3-OS）
+                self._consecutive_failures[credential.record_id] = self._consecutive_failures.get(credential.record_id, 0) + 1
+                if self._consecutive_failures[credential.record_id] < PROBE_FAIL_TOLERANCE:
+                    continue
+                try:
+                    self._write_ui_state(credential, display_status, note)
+                except Exception as write_error:
+                    print(f"WARNING: unable to write health result: {write_error}", file=sys.stderr)
         return healthy
 
     def _write_ui_state(self, credential: Credential, status: str, note: str) -> None:
         """Keep the Claude-only Feishu table useful as a live status board."""
         if not credential.record_id:
             return
-        self._known_status[credential.record_id] = status
-        token = self._token()
-        fields = {
-            FIELD_ALIASES["status"][0]: status,
-            FIELD_ALIASES["note"][0]: note[:300],
-        }
-        payload = json.dumps({"fields": fields}, ensure_ascii=False).encode("utf-8")
-        request = Request(
-            f"{FEISHU_API}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records/{credential.record_id}",
-            data=payload,
-            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
-            method="PUT",
-        )
-        with urlopen(request, timeout=15) as response:
-            result = json.loads(response.read())
-        if result.get("code") != 0:
-            raise RuntimeError(result.get("msg", "Feishu status update failed"))
+        with self._lock:
+            token = self._token()
+            fields = {
+                FIELD_ALIASES["status"][0]: status,
+                FIELD_ALIASES["note"][0]: note[:300],
+            }
+            payload = json.dumps({"fields": fields}, ensure_ascii=False).encode("utf-8")
+            last_error: str = ""
+            for attempt in range(3):
+                request = Request(
+                    f"{FEISHU_API}/bitable/v1/apps/{self.app_token}/tables/{self.table_id}/records/{credential.record_id}",
+                    data=payload,
+                    headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8"},
+                    method="PUT",
+                )
+                try:
+                    with urlopen(request, timeout=15) as response:
+                        result = json.loads(response.read())
+                except HTTPError as http_err:
+                    body = http_err.read().decode("utf-8", "replace") if http_err.fp else ""
+                    # Feishu 429 限流时重试
+                    if http_err.code == 429 and attempt < 2:
+                        time.sleep(1 + attempt)
+                        continue
+                    raise RuntimeError(f"Feishu PUT HTTP {http_err.code}: {body[:120]}")
+                except URLError as url_err:
+                    if attempt < 2:
+                        time.sleep(1)
+                        continue
+                    raise
+                if result.get("code") == 0:
+                    break
+                last_error = str(result.get("msg", "unknown"))
+                # Feishu 429 限流重试
+                if result.get("code") == 429 and attempt < 2:
+                    time.sleep(1 + attempt)
+                    continue
+                raise RuntimeError(last_error or "Feishu status update failed")
+            else:
+                if last_error:
+                    raise RuntimeError(last_error)
+            # 飞书写成功后才更新内存状态，保证内存与飞书一致（P4-OS）；
+            # 写入失败时内存保持旧值，_sync_dashboard 下轮会重试修复（P5-OS）
+            self._known_status[credential.record_id] = status
 
     def _sync_dashboard(self, credentials: list[Credential], active: Credential) -> None:
         """Mark standby routes healthy. A passing probe also restores 限流/额度耗尽
-        rows back to 正常 (recovery), so a transient failure never freezes a key."""
+        rows back to 正常 (recovery), so a transient failure never freezes a key.
+        Already-correct rows are skipped to avoid redundant Feishu writes."""
         for credential in credentials:
             try:
-                if credential.record_id != active.record_id and self._known_status.get(credential.record_id) != "✅ 正常":
-                    self._write_ui_state(credential, "✅ 正常", "Claude Code 凭证池待命（探活通过）")
+                if credential.record_id == active.record_id:
+                    continue
+                cached = self._known_status.get(credential.record_id)
+                if cached and cached.startswith("✅"):
+                    continue
+                # 成功恢复与失败降级对称：连续成功未达阈值不写回"✅ 正常"，
+                # 防止 dashboard 同步绕过探活容错把状态提前翻绿（P13-OS）
+                if self._consecutive_successes.get(credential.record_id, 0) < PROBE_SUCCESS_TOLERANCE:
+                    continue
+                self._write_ui_state(credential, "✅ 正常", "Claude Code 凭证池待命（探活通过）")
             except Exception as error:
                 print(f"WARNING: unable to update Claude credential dashboard: {error}", file=sys.stderr)
 
@@ -293,15 +407,52 @@ class CredentialPool:
             except Exception as error:
                 print(f"WARNING: unable to mark incomplete credential: {error}", file=sys.stderr)
 
-    def current(self) -> Credential:
+    def _probe_credential(self, credential: Credential) -> bool:
+        """Real-time single-credential probe used before actually switching to it.
+        The periodic probe only refreshes the UI status; a real switch must
+        re-verify the key is currently usable so a stale (25-min-old) result
+        never routes a real request to a now-dead credential."""
+        model = credential.model or PROBE_MODEL
+        if is_claude_model(model) or is_anthropic_endpoint(credential.base_url):
+            path = "/v1/messages"
+            headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+            body = json.dumps(
+                {"model": model, "max_tokens": 1, "messages": [{"role": "user", "content": "ping"}]},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        else:
+            path = "/v1/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            body = json.dumps(
+                {"model": model, "messages": [{"role": "user", "content": "ping"}], "max_tokens": 1},
+                separators=(",", ":"),
+            ).encode("utf-8")
+        identity = credential_identity(credential)
+        scheme = self._auth_override.get(identity) or _auth_scheme(model, credential.base_url)
+        status_code, _headers, response = forward(credential, path, body, headers, timeout=PROBE_TIMEOUT, auth_scheme=scheme)
+        if status_code in (401, 403):
+            alt = "bearer" if scheme == "x-api-key" else "x-api-key"
+            alt_status, alt_headers, alt_body = forward(credential, path, body, headers, timeout=PROBE_TIMEOUT, auth_scheme=alt)
+            if 200 <= alt_status < 300:
+                with self._lock:
+                    self._auth_override[identity] = alt
+                return True
+            return False
+        self._last_probe[credential.record_id] = time.time()
+        return 200 <= status_code < 300
+
+    def current(self, verify: bool = False) -> Credential:
         with self._lock:
             if not self._credentials:
                 self.refresh()
             for offset in range(len(self._credentials)):
                 candidate = self._credentials[(self._index + offset) % len(self._credentials)]
-                if candidate.api_key not in self._bad:
-                    self._index = (self._index + offset) % len(self._credentials)
-                    return candidate
+                if credential_identity(candidate) not in self._bad:
+                    # 真实使用前实时探活确认（verify=True）：避免用 25 分钟前的探活
+                    # 结果选到已失效凭证。仅 UI/显示用途（/health）不探活。
+                    if not verify or self._probe_credential(candidate):
+                        self._index = (self._index + offset) % len(self._credentials)
+                        return candidate
             return self._credentials[self._index]
 
     def next_after(self, failed: Credential) -> Credential | None:
@@ -311,9 +462,11 @@ class CredentialPool:
             start = next((i for i, item in enumerate(self._credentials) if credential_identity(item) == credential_identity(failed)), self._index)
             for offset in range(1, len(self._credentials)):
                 candidate = self._credentials[(start + offset) % len(self._credentials)]
-                if candidate.api_key != failed.api_key and candidate.api_key not in self._bad:
-                    self._index = (start + offset) % len(self._credentials)
-                    break
+                if credential_identity(candidate) != credential_identity(failed) and credential_identity(candidate) not in self._bad:
+                    # 切换前实时探活确认，避免切到已失效凭证
+                    if self._probe_credential(candidate):
+                        self._index = (start + offset) % len(self._credentials)
+                        break
             else:
                 if not self._advance_tier():
                     return None
@@ -336,9 +489,11 @@ class CredentialPool:
             start = self._index
             for offset in range(1, len(self._credentials)):
                 candidate = self._credentials[(start + offset) % len(self._credentials)]
-                if candidate.api_key not in self._bad:
-                    self._index = (start + offset) % len(self._credentials)
-                    break
+                if credential_identity(candidate) not in self._bad:
+                    # 手动切换前同样实时探活确认
+                    if self._probe_credential(candidate):
+                        self._index = (start + offset) % len(self._credentials)
+                        break
             else:
                 if not self._advance_tier():
                     return None
@@ -354,7 +509,7 @@ class CredentialPool:
         for tier in sorted(self._by_tier):
             if tier <= self._active_tier:
                 continue
-            available = [i for i, c in enumerate(self._by_tier[tier]) if c.api_key not in self._bad]
+            available = [i for i, c in enumerate(self._by_tier[tier]) if credential_identity(c) not in self._bad]
             if available:
                 self._active_tier = tier
                 self._credentials = list(self._by_tier[tier])
@@ -368,7 +523,8 @@ class CredentialPool:
     def mark_failure(self, credential: Credential, status: int, reason: str) -> None:
         if not credential.record_id:
             return
-        self._bad.add(credential.api_key)
+        with self._lock:
+            self._bad.add(credential_identity(credential))
         try:
             if status == 429:
                 self._write_ui_state(credential, "⛔ 限流", f"HTTP 429；{reason[:160]}")
@@ -383,6 +539,55 @@ def is_quota_failure(status: int, body: bytes) -> bool:
     return status in RETRYABLE_STATUS and (status == 429 or any(word in text for word in QUOTA_WORDS))
 
 
+def is_claude_model(model: str) -> bool:
+    """True when the model speaks Anthropic Messages; otherwise OpenAI-compatible."""
+    name = model.strip().lower()
+    if not name:
+        return True
+    return any(word in name for word in CLAUDE_MODEL_KEYWORDS)
+
+
+def is_anthropic_endpoint(base_url: str) -> bool:
+    """True when the base URL is an Anthropic-compatible endpoint (e.g. ends
+    with /anthropic or contains /v1/messages), even if the pinned model name
+    is not a Claude-family name (e.g. qwen / mimo / deepseek behind an
+    Anthropic-compatible gateway)."""
+    url = (base_url or "").lower()
+    return "/anthropic" in url or "/v1/messages" in url
+
+
+def _auth_scheme(model: str, base_url: str = "") -> str:
+    """鉴权头方案由"模型名 + 端点"共同决定。Anthropic 兼容端点（base_url 含
+    /v1/messages 或 /anthropic）用 x-api-key（Anthropic 惯例）；纯 OpenAI 兼容
+    端点用 Bearer。opencode.ai / 小米 / DeepSeek 等 Anthropic 网关都期望 x-api-key，
+    即使 pinned model 是非 Claude 名。"""
+    if is_anthropic_endpoint(base_url):
+        return "x-api-key"
+    return "x-api-key" if is_claude_model(model) else "bearer"
+
+
+def _apply_auth(outbound: dict[str, str], credential: Credential, scheme: str) -> None:
+    if scheme == "x-api-key":
+        outbound["x-api-key"] = credential.api_key
+    else:
+        outbound["Authorization"] = f"Bearer {credential.api_key}"
+
+
+def join_target(base_url: str, path: str) -> str:
+    """Join Base URL + request path without stacking duplicate version segments
+    (https://host/v1 + /v1/messages -> https://host/v1/messages;
+     https://host/v1/messages + /v1/messages -> https://host/v1/messages)."""
+    base = base_url.rstrip("/")
+    rel = path.lstrip("/")
+    segment = rel.split("/", 1)[0]
+    if segment[:1] == "v" and segment[1:].isdigit():
+        if base.endswith("/" + segment):
+            base = base[: -(len(segment) + 1)]
+        elif ("/" + segment + "/") in base:
+            base = base.split("/" + segment + "/", 1)[0]
+    return base + "/" + rel
+
+
 def forward(
     credential: Credential,
     path: str,
@@ -390,28 +595,34 @@ def forward(
     headers: dict[str, str],
     on_headers: Any = None,
     on_chunk: Any = None,
+    timeout: int = 600,
+    auth_scheme: str | None = None,
 ) -> tuple[int, dict[str, str], bytes]:
     # Base URL may be https://host/api/anthropic or https://host/v1; preserve
-    # the Claude request path so every Anthropic-compatible DeepSeek gateway works.
-    target = credential.base_url.rstrip("/") + "/" + path.lstrip("/")
-    # A table row can pin the actual gateway model for this key.  This lets a
-    # Claude Code session keep its familiar model setting while the proxy uses
-    # the DeepSeek model accepted by the configured Anthropic-compatible API.
+    # the request path so every Anthropic / OpenAI compatible gateway works.
+    target = join_target(credential.base_url, path)
+    # A table row can pin the actual gateway model for this key.  Probes use
+    # credential.model directly, but skip the rewrite when the body is our
+    # short-lived ping payload (PROBE_MODEL) so the rewrite cannot feed bogus
+    # model strings back into the upstream on the next refresh cycle.
     if credential.model:
         try:
             request_json = json.loads(body)
-            if isinstance(request_json, dict):
+            if isinstance(request_json, dict) and request_json.get("model") != PROBE_MODEL:
                 request_json["model"] = credential.model
                 body = json.dumps(request_json, ensure_ascii=False, separators=(",", ":")).encode()
         except (UnicodeDecodeError, json.JSONDecodeError):
             pass
     outbound = {key: value for key, value in headers.items() if key.lower() not in {"host", "content-length", "x-api-key", "authorization", "connection"}}
-    outbound["x-api-key"] = credential.api_key
-    outbound["Authorization"] = f"Bearer {credential.api_key}"
+    if "user-agent" not in {key.lower() for key in outbound}:
+        outbound["User-Agent"] = UPSTREAM_USER_AGENT
+    # 鉴权方案默认按模型名决定（Claude→x-api-key，其余→Bearer）；显式 auth_scheme
+    # 优先（探活学习到对侧方案或 401/403 重试时使用），见 _auth_override
+    _apply_auth(outbound, credential, auth_scheme or _auth_scheme(credential.model, credential.base_url))
     outbound["Content-Length"] = str(len(body))
     request = Request(target, data=body, headers=outbound, method="POST")
     try:
-        with urlopen(request, timeout=600) as response:
+        with urlopen(request, timeout=timeout) as response:
             status = response.status
             response_headers = dict(response.headers.items())
             if on_headers is not None:
@@ -429,6 +640,8 @@ def forward(
         return error.code, dict(error.headers.items()) if error.headers else {}, error.read()
     except URLError as error:
         return 503, {"Content-Type": "application/json"}, json.dumps({"error": {"message": str(error), "type": "proxy_error"}}).encode()
+    except (TimeoutError, OSError) as error:
+        return 503, {"Content-Type": "application/json"}, json.dumps({"error": {"message": str(error), "type": "proxy_timeout"}}).encode()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -481,7 +694,8 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         body = self.rfile.read(length)
         try:
-            credential = self.pool.current()
+            # 真实请求前实时探活确认，避免切到已失效凭证
+            credential = self.pool.current(verify=True)
         except Exception as error:
             self._send(503, {"Content-Type": "application/json"}, json.dumps({"error": {"message": str(error), "type": "credential_pool_error"}}).encode())
             return
@@ -507,6 +721,7 @@ class Handler(BaseHTTPRequestHandler):
                 dict(self.headers.items()),
                 on_headers=self._on_upstream_headers,
                 on_chunk=self._on_upstream_chunk,
+                auth_scheme=self.pool._auth_override.get(credential_identity(credential)),
             )
             if self._streaming:
                 return

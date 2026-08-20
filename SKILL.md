@@ -2,7 +2,7 @@
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
-version: 7.21.0
+version: 7.22.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -431,6 +431,19 @@ credential-pool-sync/
 
 ## Version history
 
+### v7.22.0 (2026-08-19)
+
+- **Fixed Claude Code credential pool health check and status sync (open code / 硅基流动 / ARK flapping)**:
+  - **P1**: Fixed `join_target` URL deduplication for base URLs containing `/v1/messages` mid-path.
+  - **P2**: Extended `is_claude_model` / `CLAUDE_MODEL_KEYWORDS` to include `glm`, `zai-org`, `deepseek`.
+  - **P3**: Introduced `is_anthropic_endpoint(base_url)` and `_auth_scheme(model, base_url)`.
+  - **P4**: Added `UPSTREAM_USER_AGENT` and `User-Agent: OpenAI/Python` fallback.
+  - **P5**: Added `PROBE_INTERVAL` throttling and `_probe_credential()` real-time verify.
+  - **P6**: Fixed `_write_ui_state` retry and `forward()` TimeoutError handling.
+  - **P7**: Fixed `_consecutive_failures` hysteresis and `_known_status` update order.
+- **Integrated Claude Code credential pool scripts** into workdir for GitHub sync.
+- **Bumped SKILL.md version** to `v7.22.0`.
+
 ### v7.21.0 (2026-08-17)
 
 - **Fixed MiniMax health check false failure (root cause: cold start timeout)**:
@@ -655,7 +668,7 @@ credential-pool-sync/
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
-version: 7.21.0
+version: 7.22.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
