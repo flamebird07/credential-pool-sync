@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""凭证池同步脚本 v7.23.0 — 含连通性验证、状态回写和安全配置加载。"""
+"""凭证池同步脚本 v7.24.0 — 含连通性验证、状态回写和安全配置加载。"""
 import argparse, json, os, sys, urllib.request, urllib.error, time, subprocess, re, msvcrt
 import random
 import uuid
@@ -1057,7 +1057,7 @@ def _read_existing_auth():
 
 
 def _sync_unlocked(skip_health_rotate=False):
-    print("="*50); print("凭证池同步 v7.23.0"); print("="*50)
+    print("="*50); print("凭证池同步 v7.24.0"); print("="*50)
     tok = gt()
     rs = gr(tok); print(f"\n📋 飞书: {len(rs)} 条")
     pending_updates = []

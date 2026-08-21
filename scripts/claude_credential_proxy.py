@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Claude Code credential-pool proxy v7.23.0.
+"""Claude Code credential-pool proxy v7.24.0.
 
 The proxy keeps one stable local endpoint for Claude Code.  It reads its own
 Feishu Bitable (never Hermes' table) and retries a request with the next
@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -46,7 +47,8 @@ PROBE_INTERVAL_DEGRADED = 120  # 探活失败凭证每 2 分钟重试一次（�
 PROBE_FAIL_TOLERANCE = 2  # 任意凭证连续失败达到该次数才降级写坏状态，避免瞬时抖动
 PROBE_SUCCESS_TOLERANCE = 1  # 恢复对称容错：连续成功达到该次数才写回"✅ 正常"（1=立即恢复，因失败方向已有容错防抖动）
 CLAUDE_MODEL_KEYWORDS = ("claude", "sonnet", "opus", "haiku", "fable", "mythos", "glm", "zai-org", "deepseek")
-CLAUDE_AGENT_NAME = "Claude Code"
+CLAUDE_AGENT_NAME = f"Claude Code({socket.gethostname()})"  # P-07: 标注主机名，区分多台机器的"使用中"标记
+CLAUDE_LEGACY_AGENT_NAME = "Claude Code"  # P-07 前本代理写入的旧格式标记（无主机名），迁移时作为自身遗留剥离
 CLAUDE_IN_USE_STATUS = f"🔄 {CLAUDE_AGENT_NAME}使用中"
 UPSTREAM_USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 CONFIG_PATH = Path(os.getenv("LOCALAPPDATA", str(Path.home() / "AppData/Local"))) / "ClaudeCodeCredentialPool" / "config.json"
@@ -303,6 +305,8 @@ class CredentialPool:
             raise RuntimeError("No healthy credentials in the Claude Code Feishu table")
         by_tier = self._group_by_tier(healthy)
         with self._lock:
+            previous = self._credentials[self._index] if self._credentials else None
+            previous_record_id = previous.record_id if previous else ""
             pending_ids = self._pending_identities()
             # selectable_by_tier 从 healthy（已探活通过）派生，再过滤掉
             # _bad 与 pending identity，保证选出的档在 by_tier 中真实存在；
@@ -326,11 +330,17 @@ class CredentialPool:
             current_identity = credential_identity(self._credentials[self._index]) if self._credentials else None
             self._credentials = list(by_tier[active_tier])
             self._index = next(
-                (i for i, item in enumerate(self._credentials) if credential_identity(item) == current_identity),
-                0,
+                (i for i, item in enumerate(self._credentials) if item.record_id == previous_record_id),
+                next(
+                    (i for i, item in enumerate(self._credentials) if credential_identity(item) == current_identity),
+                    0,
+                ),
             )
             active = self._credentials[self._index]
             self._active_record_id = active.record_id
+            need_move = previous is not None and credential_identity(previous) != credential_identity(active)
+        if need_move:
+            self._move_active_in_use(previous, active, "定时刷新切换成功")
         self._sync_dashboard(healthy, active)
         self._mark_incomplete_records(incomplete_records)
         return list(healthy)
@@ -451,6 +461,7 @@ class CredentialPool:
 
         with ThreadPoolExecutor(max_workers=min(8, len(to_probe) or 1)) as pool:
             results = list(pool.map(probe, to_probe))
+        ui_updates: list[tuple[Credential, str, str]] = []
         with self._lock:
             for credential, status_code, response in results:
                 identity = credential_identity(credential)
@@ -461,10 +472,7 @@ class CredentialPool:
                     if self._consecutive_successes[identity] >= PROBE_SUCCESS_TOLERANCE:
                         cached_status = self._known_status.get(identity, "")
                         if not is_in_use_by_agent(cached_status, CLAUDE_AGENT_NAME):
-                            try:
-                                self._write_ui_state(credential, "✅ 正常", "Claude Code 凭证池待命（探活通过）")
-                            except Exception as write_error:
-                                print(f"WARNING: unable to write healthy result: {write_error}", file=sys.stderr)
+                            ui_updates.append((credential, "✅ 正常", "Claude Code 凭证池待命（探活通过）"))
                     healthy.append(credential)
                     continue
                 # Keep the failed credential in memory (not the active pool) so a
@@ -488,10 +496,14 @@ class CredentialPool:
                 self._consecutive_failures[identity] = self._consecutive_failures.get(identity, 0) + 1
                 if self._consecutive_failures[identity] < PROBE_FAIL_TOLERANCE:
                     continue
-                try:
-                    self._write_ui_state(credential, display_status, note)
-                except Exception as write_error:
-                    print(f"WARNING: unable to write health result: {write_error}", file=sys.stderr)
+                ui_updates.append((credential, display_status, note))
+        # Do not acquire _ui_lock while holding _lock: ownership moves use the
+        # opposite, _ui_lock -> _lock order to make their check-and-write atomic.
+        for credential, status, note in ui_updates:
+            try:
+                self._write_ui_state(credential, status, note)
+            except Exception as write_error:
+                print(f"WARNING: unable to write health result: {write_error}", file=sys.stderr)
         healthy.sort(key=lambda credential: (credential.priority, stable_order.get(credential.record_id, 0)))
         return healthy
 
@@ -514,11 +526,28 @@ class CredentialPool:
         with self._ui_lock:
             current_status = self._read_record_status(credential)
             if status == CLAUDE_IN_USE_STATUS:
-                target_status = _status_add(current_status, CLAUDE_AGENT_NAME)
+                # P-07: 落主机名限定的新标记前，先剥离本代理历史遗留的旧格式
+                # "Claude Code"（无括号）token，避免与 "(主机名)" 新标记并列双写。
+                target_status = _status_add(_status_remove(current_status, CLAUDE_LEGACY_AGENT_NAME), CLAUDE_AGENT_NAME)
             else:
-                target_status = _status_remove(current_status, CLAUDE_AGENT_NAME)
-                if not _agents(target_status):
-                    target_status = status
+                # A delayed health/dashboard result must never clear the
+                # marker on the row that became active after it was queued.
+                # Only an ownership move is allowed to remove that marker.
+                with self._lock:
+                    is_active = credential.record_id == self._active_record_id
+                if is_active and (
+                    is_in_use_by_agent(current_status, CLAUDE_AGENT_NAME)
+                    or is_in_use_by_agent(current_status, CLAUDE_LEGACY_AGENT_NAME)
+                ):
+                    target_status = current_status
+                else:
+                    # P-07: 非 active 行的待命清理——除新名字外，旧格式 "Claude Code"
+                    # token 也一并剥离；其他机器按新格式写的标记（Claude Code(他机)）
+                    # 与其他 Agent 标记（如 Hermes）因名字不同而保留，不会误清。
+                    target_status = _status_remove(current_status, CLAUDE_AGENT_NAME)
+                    target_status = _status_remove(target_status, CLAUDE_LEGACY_AGENT_NAME)
+                    if not _agents(target_status):
+                        target_status = status
             with self._lock:
                 cached_status = self._known_status.get(identity, "")
                 cached_note = self._known_note.get(identity, "")
@@ -603,8 +632,10 @@ class CredentialPool:
                 # 防止 dashboard 同步绕过探活容错把状态提前翻绿（P13-OS）
                 if self._consecutive_successes.get(identity, 0) < PROBE_SUCCESS_TOLERANCE:
                     continue
-                if is_in_use_by_agent(cached or "", CLAUDE_AGENT_NAME):
-                    continue
+                # A non-active row may still carry a marker from an older
+                # proxy process or a Feishu write that raced a previous
+                # rotation.  Write it through the normal merge path so only
+                # Claude Code is removed; markers owned by other agents stay.
                 self._write_ui_state(credential, "✅ 正常", "Claude Code 凭证池待命（探活通过）")
             except Exception as error:
                 print(f"WARNING: unable to update Claude credential dashboard: {error}", file=sys.stderr)
@@ -699,8 +730,12 @@ class CredentialPool:
             # 结果选到已失效凭证。仅 UI/显示用途（/health）不探活。
             if not verify or self._probe_credential(candidate):
                 with self._lock:
+                    previous = self._credentials[self._index]
                     self._index = (self._index + offset) % len(self._credentials)
                     self._active_record_id = candidate.record_id
+                    need_move = verify and credential_identity(previous) != credential_identity(candidate)
+                if need_move:
+                    self._move_active_in_use(previous, candidate, "实时探活切换成功")
                 return candidate
         with self._lock:
             return self._credentials[self._index] if self._credentials else None
@@ -715,8 +750,8 @@ class CredentialPool:
                 self._index,
             )
             candidate: Credential | None = None
-            previous: Credential | None = None
             previous_index = self._index
+            previous = self._credentials[previous_index] if self._credentials else None
             for offset in range(1, len(self._credentials)):
                 candidate = self._credentials[(start + offset) % len(self._credentials)]
                 identity = credential_identity(candidate)
@@ -730,7 +765,6 @@ class CredentialPool:
                         if identity not in self._pending_identities():
                             self._bad.discard(identity)
                         self._degraded = [c for c in self._degraded if credential_identity(c) != identity]
-                        previous = self._credentials[previous_index] if self._credentials else None
                         self._index = (start + offset) % len(self._credentials)
                         self._active_record_id = candidate.record_id
                     break
@@ -738,11 +772,10 @@ class CredentialPool:
                 if not self._advance_tier():
                     return None
                 with self._lock:
-                    previous = self._credentials[previous_index] if self._credentials else None
                     candidate = self._credentials[self._index]
-                    self._active_record_id = candidate.record_id
-        self._clear_previous_in_use(previous, candidate)
-        self._write_active_in_use(candidate, "自动切换成功")
+            need_move = previous is not None and candidate is not None and credential_identity(previous) != credential_identity(candidate)
+        if need_move:
+            self._move_active_in_use(previous, candidate, "自动切换成功")
         return candidate
 
     def rotate(self) -> Credential | None:
@@ -752,11 +785,13 @@ class CredentialPool:
                 return None
             start = self._index
             candidate: Credential | None = None
-            previous: Credential | None = None
             previous_index = self._index
+            previous = self._credentials[previous_index] if self._credentials else None
             for offset in range(1, len(self._credentials)):
                 candidate = self._credentials[(start + offset) % len(self._credentials)]
                 identity = credential_identity(candidate)
+                if identity == credential_identity(previous):
+                    continue
                 with self._lock:
                     if identity in self._bad and candidate not in self._degraded:
                         continue
@@ -765,7 +800,6 @@ class CredentialPool:
                         if identity not in self._pending_identities():
                             self._bad.discard(identity)
                         self._degraded = [c for c in self._degraded if credential_identity(c) != identity]
-                        previous = self._credentials[previous_index] if self._credentials else None
                         self._index = (start + offset) % len(self._credentials)
                         self._active_record_id = candidate.record_id
                     break
@@ -773,24 +807,25 @@ class CredentialPool:
                 if not self._advance_tier():
                     return None
                 with self._lock:
-                    previous = self._credentials[previous_index] if self._credentials else None
                     candidate = self._credentials[self._index]
-                    self._active_record_id = candidate.record_id
-        self._clear_previous_in_use(previous, candidate)
-        self._write_active_in_use(candidate, "手动切换成功")
+            need_move = previous is not None and candidate is not None and credential_identity(previous) != credential_identity(candidate)
+        if need_move:
+            self._move_active_in_use(previous, candidate, "手动切换成功")
         return candidate
 
     def _advance_tier(self) -> bool:
         """active 档耗尽后推进到下一个仍含健康可选用凭证的档。"""
-        for tier in sorted(self._by_tier):
-            if tier <= self._active_tier:
-                continue
-            available = [i for i, c in enumerate(self._by_tier[tier]) if credential_identity(c) not in self._bad]
-            if available:
-                self._active_tier = tier
-                self._credentials = list(self._by_tier[tier])
-                self._index = available[0]
-                return True
+        with self._lock:
+            for tier in sorted(self._by_tier):
+                if tier <= self._active_tier:
+                    continue
+                available = [i for i, c in enumerate(self._by_tier[tier]) if credential_identity(c) not in self._bad]
+                if available:
+                    self._active_tier = tier
+                    self._credentials = list(self._by_tier[tier])
+                    self._index = available[0]
+                    self._active_record_id = self._credentials[self._index].record_id
+                    return True
         return False
 
     def _total_healthy(self) -> int:
@@ -820,6 +855,22 @@ class CredentialPool:
             )
         except Exception as error:
             print(f"WARNING: unable to mark active credential: {error}", file=sys.stderr)
+
+    def _move_active_in_use(self, previous: Credential | None, candidate: Credential, reason: str) -> None:
+        """Move the Claude ownership marker as one serialised UI transition.
+
+        The active check is performed after acquiring _ui_lock, so a stale
+        A->B transition queued behind a newer B->C transition cannot write
+        its old marker after C becomes active. The two Feishu PUTs and the
+        check are serialised under _ui_lock; the brief state check takes
+        _lock in the same _ui_lock -> _lock order as _write_ui_state.
+        """
+        with self._ui_lock:
+            with self._lock:
+                if candidate.record_id != self._active_record_id:
+                    return
+            self._clear_previous_in_use(previous, candidate)
+            self._write_active_in_use(candidate, reason)
 
     def mark_failure(self, credential: Credential, status: int, reason: str) -> None:
         if not credential.record_id:
@@ -1024,10 +1075,10 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as error:
             self._send(503, {"Content-Type": "application/json"}, json.dumps({"error": {"message": str(error), "type": "credential_pool_error"}}).encode())
             return
-        try:
-            self.pool._write_ui_state(credential, CLAUDE_IN_USE_STATUS, f"本机代理已连接；当前模型：{credential.model or '未填写'}")
-        except Exception as error:
-            print(f"WARNING: unable to mark active credential: {error}", file=sys.stderr)
+        # The request path may race a refresh or a quota-triggered rotate.
+        # Route the marker through the serialised ownership transition so a
+        # stale request cannot re-mark an older Feishu row as active.
+        self.pool._move_active_in_use(None, credential, "本机代理已连接")
         # Retry every other key once.  Claude Code stays connected to this
         # process, so a quota event is invisible to its development session.
         attempts = 0

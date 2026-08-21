@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Reconcile Feishu credential status with the active Hermes model v7.23.0。"""
+"""Reconcile Feishu credential status with the active Hermes model v7.24.0。"""
 
 import os
 import sys

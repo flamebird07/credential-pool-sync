@@ -2,7 +2,7 @@
 ---
 name: credential-pool-sync
 description: "Synchronize, health-check, rotate, and reconcile credentials stored in Feishu Bitable for Hermes and Claude Code. Use when enabling the Claude Code credential pool, switching exhausted credentials, or managing Feishu credential-pool health."
-version: 7.23.0
+version: 7.24.0
 author: Hermes Agent
 platforms: [windows]
 metadata:
@@ -11,7 +11,7 @@ metadata:
     related_skills: [feishu-bitable, hermes-agent]
 ---
 
-# Credential Pool Sync v7.23.0
+# Credential Pool Sync v7.24.0
 
 This skill synchronizes API credentials from Feishu into Hermes `auth.json`, rotates the active model in `config.yaml`, and reconciles Feishu health/in-use status. The installed skill directory is canonical at:
 
@@ -433,6 +433,18 @@ credential-pool-sync/
 ```
 
 ## Version history
+
+### v7.24.0 (2026-08-21)
+
+- **Fixed Claude Code Feishu display: hostname-qualified marker and stale multi-row cleanup (P-32~P-38):**
+  - **P-32 Hostname-qualified marker:** `CLAUDE_AGENT_NAME` changed from `Claude Code` to `f"Claude Code({socket.gethostname()})"` (`🔄 Claude Code(2209直播间)使用中`), so multi-machine sharing the same Bitable is distinguishable; `CLAUDE_LEGACY_AGENT_NAME = "Claude Code"` kept for migration.
+  - **P-33 Stale-row cleanup on refresh:** `refresh()` now snapshots `previous` by `record_id` (not just identity), preserves current healthy tier, and after selecting `active` calls `_move_active_in_use(previous, active)` to atomically clear the old row and mark the new one; handles legacy bare token stripping.
+  - **P-34 Health-filter deadlock avoidance:** `_health_filter()` batches `ui_updates` outside `_lock` and writes after, avoiding `_lock -> _ui_lock` vs `_ui_lock -> _lock` inversion.
+  - **P-35 Delayed-dashboard guard:** `_write_ui_state()` for non-active rows checks `is_active` under `_lock`; if the row became active while the health result was queued, the `✅ 正常` write keeps `current_status` instead of clearing `Claude Code(... )使用中`.
+  - **P-36 Atomic ownership moves:** `current(verify=True)`, `next_after`, `rotate`, `_advance_tier` now capture `previous` inside `_lock`, update `_active_record_id` inside `_lock`, and delegate to `_move_active_in_use` with `need_move` outside `_lock`; `_advance_tier` now holds `_lock` and syncs `_active_record_id`.
+  - **P-37 Handler race:** `Handler.do_POST` now routes `本机代理已连接` through `_move_active_in_use(None, credential)` with `_ui_lock -> _lock` stale check (`candidate.record_id != _active_record_id` → skip), preventing a stale request from re-marking an older row after a newer B→C switch.
+  - **P-38 Legacy migration:** Non-active rows containing the bare legacy `Claude Code` token are stripped to `✅ 正常` (preserving other Agent tokens like `Hermes`) during refresh/standby cleanup, without touching other machines' qualified markers.
+  - **Verified:** `py_compile` 8/8 scripts, `pytest` 12 passed (new `test_f_p10`/`test_f_p11`/`test_f_p12` legacy-strip cases), `git diff --check` clean, `health` 200, Feishu 3→0 stale `使用中` cleared to `✅ 正常`.
 
 ### v7.23.0 (2026-08-20)
 
